@@ -689,6 +689,18 @@ body {
   color: var(--slate-muted);
 }
 
+.status-pill {
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 6px;
+}
+
+.status-pill.paused {
+  background: rgba(234, 179, 8, 0.15);
+  color: #b45309;
+  border: 1px solid rgba(234, 179, 8, 0.35);
+}
+
 .helper-text {
   margin: 0 0 0 24px;
   font-size: 11px;

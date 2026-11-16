@@ -47,12 +47,11 @@ const baseLayers = {
 };
 
 let activeBaseKey = 'mml-tausta';
-baseLayers[activeBaseKey].addTo(map);
 
 // ---------------------------------------------------------------------------
 // 2. Government & Nautical WMS / WMTS Overlays
 // ---------------------------------------------------------------------------
-function makeTraficomWmts(layerName, opacity = 0.85) {
+function makeTraficomWmts(layerName, opacity = 1.0) {
   const encoded = encodeURIComponent(layerName);
   return L.tileLayer(
     `https://julkinen.traficom.fi/rasteripalvelu/wmts?service=WMTS&request=GetTile&version=1.0.0&layer=${encoded}&style=&format=image/png&TileMatrixSet=WGS84_Pseudo-Mercator&TileMatrix=WGS84_Pseudo-Mercator:{z}&TileRow={y}&TileCol={x}`,
@@ -65,21 +64,75 @@ function makeTraficomWmts(layerName, opacity = 0.85) {
 }
 
 const traficomChartLayers = {
-  merikarttasarjat: makeTraficomWmts('Traficom:Merikarttasarjat public', 0.85),
-  veneilykartat: makeTraficomWmts('Traficom:Veneilykartat public', 0.85),
-  rannikkokartat: makeTraficomWmts('Traficom:Rannikkokartat public', 0.85),
+  merikarttasarjat: makeTraficomWmts('Traficom:Merikarttasarjat public', 1.0),
+  veneilykartat: makeTraficomWmts('Traficom:Veneilykartat public', 1.0),
+  rannikkokartat: makeTraficomWmts('Traficom:Rannikkokartat public', 1.0),
   s57: L.tileLayer.wms('https://julkinen.traficom.fi/s57/wms', {
     layers: 'cells',
     format: 'image/png',
     transparent: true,
     version: '1.3.0',
-    opacity: 0.85,
+    opacity: 1.0,
     attribution: '© Traficom S-57 (CC BY 4.0)',
   }),
 };
 
 let activeTraficomSeries = 'merikarttasarjat';
 let activeTraficomLayer = traficomChartLayers[activeTraficomSeries];
+
+/**
+ * Synchronize base map visibility to ensure that when a full topmost chart
+ * (e.g. Traficom Nautical Chart) is active, the underlying base map layer is
+ * completely detached from Leaflet and does NOT load redundant tiles.
+ */
+function updateBaseMapVisibility() {
+  const chartToggle = document.getElementById('toggleTraficomChart');
+  const chartEnabled = chartToggle ? chartToggle.checked : false;
+  const opacityVal = Number(document.getElementById('traficomOpacity')?.value ?? 100) / 100;
+  // When nautical chart is enabled and opacity is at or near full (>= 90%),
+  // it completely covers the map. In that state, loading the underlying base map
+  // is pure waste of bandwidth and rendering resources.
+  const chartCovering = chartEnabled && opacityVal >= 0.90;
+
+  const baseStatusBadge = document.getElementById('baseMapStatusBadge');
+  if (baseStatusBadge) {
+    if (activeBaseKey === 'none') {
+      baseStatusBadge.textContent = 'None';
+      baseStatusBadge.className = 'count-pill status-pill';
+      baseStatusBadge.style.display = 'inline-block';
+    } else if (chartCovering) {
+      baseStatusBadge.textContent = 'Paused (under chart)';
+      baseStatusBadge.className = 'count-pill status-pill paused';
+      baseStatusBadge.style.display = 'inline-block';
+    } else {
+      baseStatusBadge.style.display = 'none';
+    }
+  }
+
+  // Remove any base layer that is not activeBaseKey
+  for (const [key, layer] of Object.entries(baseLayers)) {
+    if (key !== activeBaseKey && map.hasLayer(layer)) {
+      map.removeLayer(layer);
+    }
+  }
+
+  const activeLayer = baseLayers[activeBaseKey];
+  if (!activeLayer || activeBaseKey === 'none' || chartCovering) {
+    // When covered by topmost chart or set to none, detach from map so 0 tiles are requested
+    if (activeLayer && map.hasLayer(activeLayer)) {
+      map.removeLayer(activeLayer);
+    }
+  } else {
+    // Chart is off or user explicitly lowered opacity < 90% for intentional blending
+    if (!map.hasLayer(activeLayer)) {
+      activeLayer.addTo(map);
+      activeLayer.bringToBack();
+    }
+  }
+}
+
+// Initial display of active base map
+updateBaseMapVisibility();
 
 const traficomDepthWmsLayer = L.tileLayer.wms('https://julkinen.traficom.fi/inspirepalvelu/rajoitettu/wms', {
   layers: 'DepthArea_A,DepthContour_L,Sounding_P',
@@ -897,8 +950,15 @@ async function loadDepthInView() {
     depthAreaLayer.clearLayers();
     depthContourLayer.clearLayers();
     depthSoundingLayer.clearLayers();
-    if (!map.hasLayer(traficomDepthWmsLayer)) traficomDepthWmsLayer.addTo(map);
-    setCountBadge('countDepth', 'WMS');
+    const chartEnabled = document.getElementById('toggleTraficomChart')?.checked ?? false;
+    // If nautical chart is active, it already provides depth charts at low zoom;
+    // do not load redundant WMS depth tiles underneath or over it!
+    if (!chartEnabled && !map.hasLayer(traficomDepthWmsLayer)) {
+      traficomDepthWmsLayer.addTo(map);
+    } else if (chartEnabled && map.hasLayer(traficomDepthWmsLayer)) {
+      map.removeLayer(traficomDepthWmsLayer);
+    }
+    setCountBadge('countDepth', chartEnabled ? 'on chart' : 'WMS');
     return;
   }
 
@@ -2535,16 +2595,23 @@ document.querySelectorAll('input[name="basemap"]').forEach((radio) => {
   radio.addEventListener('change', (e) => {
     const nextKey = e.target.value;
     if (nextKey === activeBaseKey) return;
-    map.removeLayer(baseLayers[activeBaseKey]);
     activeBaseKey = nextKey;
-    baseLayers[activeBaseKey].addTo(map);
-    baseLayers[activeBaseKey].bringToBack();
+    updateBaseMapVisibility();
   });
 });
 
 document.getElementById('toggleTraficomChart').addEventListener('change', (e) => {
-  if (e.target.checked) activeTraficomLayer.addTo(map);
-  else map.removeLayer(activeTraficomLayer);
+  if (e.target.checked) {
+    const opacity = Number(document.getElementById('traficomOpacity')?.value ?? 100) / 100;
+    activeTraficomLayer.setOpacity(opacity);
+    activeTraficomLayer.addTo(map);
+  } else {
+    map.removeLayer(activeTraficomLayer);
+  }
+  updateBaseMapVisibility();
+  if (document.getElementById('toggleTraficomDepth')?.checked && map.getZoom() < 10) {
+    loadDepthInView();
+  }
 });
 
 document.getElementById('traficomSeriesSelect').addEventListener('change', (e) => {
@@ -2553,15 +2620,17 @@ document.getElementById('traficomSeriesSelect').addEventListener('change', (e) =
   if (wasOn) map.removeLayer(activeTraficomLayer);
   activeTraficomSeries = nextSeries;
   activeTraficomLayer = traficomChartLayers[activeTraficomSeries];
-  const opacity = Number(document.getElementById('traficomOpacity').value) / 100;
+  const opacity = Number(document.getElementById('traficomOpacity')?.value ?? 100) / 100;
   activeTraficomLayer.setOpacity(opacity);
   if (wasOn) activeTraficomLayer.addTo(map);
+  updateBaseMapVisibility();
 });
 
 document.getElementById('traficomOpacity').addEventListener('input', (e) => {
   const pct = Number(e.target.value);
   document.getElementById('traficomOpacityVal').textContent = `${pct}%`;
   activeTraficomLayer.setOpacity(pct / 100);
+  updateBaseMapVisibility();
 });
 
 function bindSimpleOverlay(checkboxId, layer) {
@@ -2975,7 +3044,7 @@ function setAllDataLayers(enabled) {
   const chartToggle = document.getElementById('toggleTraficomChart');
   if (chartToggle) chartToggle.checked = enabled;
   if (enabled) {
-    const opacity = Number(document.getElementById('traficomOpacity')?.value ?? 85) / 100;
+    const opacity = Number(document.getElementById('traficomOpacity')?.value ?? 100) / 100;
     activeTraficomLayer.setOpacity(opacity);
     if (!map.hasLayer(activeTraficomLayer)) activeTraficomLayer.addTo(map);
   } else if (map.hasLayer(activeTraficomLayer)) {
@@ -3040,6 +3109,8 @@ function setAllDataLayers(enabled) {
     if (map.hasLayer(osmLayer)) map.removeLayer(osmLayer);
     osmLayer.clearLayers();
   }
+
+  updateBaseMapVisibility();
 }
 
 document.getElementById('allLayersOffBtn').addEventListener('click', () => setAllDataLayers(false));

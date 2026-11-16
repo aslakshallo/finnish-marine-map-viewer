@@ -358,6 +358,7 @@
               <summary class="group-title">
                 <span class="title-with-icon">🗺️ Base Map</span>
                 <span class="source-tag">MML / OSM</span>
+                <span id="baseMapStatusBadge" class="count-pill status-pill" style="display:none;"></span>
               </summary>
               <div class="group-body">
                 <label class="control-row radio">
@@ -375,6 +376,10 @@
                 <label class="control-row radio">
                   <input type="radio" name="basemap" value="osm" />
                   <span class="control-label">OpenStreetMap Standard</span>
+                </label>
+                <label class="control-row radio">
+                  <input type="radio" name="basemap" value="none" />
+                  <span class="control-label">None (Blank / Chart only)</span>
                 </label>
               </div>
             </details>
@@ -403,8 +408,8 @@
                     </select>
                     <div class="opacity-row">
                       <span>Opacity</span>
-                      <input type="range" id="traficomOpacity" min="15" max="100" value="85" />
-                      <span id="traficomOpacityVal" class="mono">85%</span>
+                      <input type="range" id="traficomOpacity" min="15" max="100" value="100" />
+                      <span id="traficomOpacityVal" class="mono">100%</span>
                     </div>
                   </div>
                 </div>
