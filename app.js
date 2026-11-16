@@ -202,6 +202,7 @@ const lipasCampfireLayer = L.layerGroup();
 const osmLayer = L.layerGroup();
 const routeSearchRenderer = L.canvas({ padding: 0.5 });
 const routeSearchLayer = L.layerGroup().addTo(map);
+const routeAlternativesLayer = L.layerGroup().addTo(map);
 const routeLayer = L.layerGroup().addTo(map);
 const routeMarksLayer = L.layerGroup().addTo(map);
 const routeEndpointsLayer = L.layerGroup().addTo(map);
@@ -1316,11 +1317,17 @@ function clearRoute() {
   routeLayer.clearLayers();
   routeMarksLayer.clearLayers();
   routeEndpointsLayer.clearLayers();
+  routeAlternativesLayer.clearLayers();
   map.doubleClickZoom.enable();
   setRoutePickMode(null);
   setRouteStatus('');
   document.getElementById('routeActiveIndicator')?.classList.add('hidden');
   document.getElementById('routeSummaryBox').classList.add('hidden');
+  const altsBar = document.getElementById('routeAlternativesBar');
+  if (altsBar) {
+    altsBar.classList.add('hidden');
+    altsBar.innerHTML = '';
+  }
   document.getElementById('routeStatGrid').innerHTML = '';
   document.getElementById('routeWarningsList').innerHTML = '';
   document.getElementById('routeLegsList').innerHTML = '';
@@ -2285,8 +2292,167 @@ function renderComputedRoute(data) {
     });
   });
 
+  renderRouteAlternatives(data);
   summaryBox.classList.remove('hidden');
   document.getElementById('routeActiveIndicator')?.classList.remove('hidden');
+}
+
+function selectRouteAlternative(targetObjective) {
+  if (!routeStart || !routeEnd) return;
+  const prefEl = document.getElementById('routePrefMode');
+  const clrEl = document.getElementById('routeClearanceMode');
+  if (targetObjective === 'fast') {
+    if (prefEl) prefEl.value = 'open_water';
+    if (clrEl) clrEl.value = 'tight';
+  } else if (targetObjective === 'safe') {
+    if (prefEl) prefEl.value = 'balanced';
+    if (clrEl) clrEl.value = 'wide';
+  } else if (targetObjective === 'fairway') {
+    if (prefEl) prefEl.value = 'strict_fairway';
+  } else if (targetObjective === 'balanced') {
+    if (prefEl) prefEl.value = 'balanced';
+    if (clrEl) clrEl.value = 'normal';
+  }
+  setRouteStatus(`Switching to ${targetObjective} route...`);
+  calculateRoute({ targetObjective });
+}
+
+function renderRouteAlternatives(data) {
+  routeAlternativesLayer.clearLayers();
+  const altsBar = document.getElementById('routeAlternativesBar');
+  const alts = data.alternatives || [];
+  const useManual = Boolean(manualWaypoints && manualWaypoints.length >= 2);
+
+  if (!altsBar) return;
+
+  if (useManual || alts.length <= 1) {
+    altsBar.classList.add('hidden');
+    altsBar.innerHTML = '';
+    return;
+  }
+
+  altsBar.classList.remove('hidden');
+
+  const profileMeta = {
+    balanced: { label: 'Balanced', icon: '⚖️', color: '#0891b2' },
+    fast: { label: 'Fast / Direct', icon: '⚡', color: '#d97706' },
+    safe: { label: 'Maximum Safety', icon: '🛡️', color: '#059669' },
+    fairway: { label: 'Official Fairways', icon: '⚓', color: '#7c3aed' },
+  };
+
+  const primaryObjId = data.objective || 'balanced';
+  const allCards = [];
+
+  const primMeta = profileMeta[primaryObjId] || { label: primaryObjId, icon: '🧭', color: '#0d9488' };
+  allCards.push({
+    objective: primaryObjId,
+    label: primMeta.label,
+    icon: primMeta.icon,
+    color: primMeta.color,
+    distanceNm: data.summary?.totalDistNm ?? 0,
+    fairwayPct: data.summary?.fairwayPct ?? 0,
+    safetyScore: data.scores?.safetyScore ?? null,
+    riskScore: data.scores?.riskScore ?? null,
+    isActive: true,
+  });
+
+  for (const alt of alts) {
+    if (alt.objective === primaryObjId) continue;
+    const meta = profileMeta[alt.objective] || {
+      label: alt.label || alt.objective,
+      icon: '🧭',
+      color: '#64748b',
+    };
+
+    const altDistNm = alt.scores?.distanceNm ?? alt.summary?.totalDistNm ?? 0;
+    const altFairwayPct = alt.scores?.fairwayPct ?? alt.summary?.fairwayPct ?? 0;
+
+    allCards.push({
+      objective: alt.objective,
+      label: meta.label,
+      icon: meta.icon,
+      color: meta.color,
+      distanceNm: altDistNm,
+      fairwayPct: altFairwayPct,
+      safetyScore: alt.scores?.safetyScore ?? null,
+      riskScore: alt.scores?.riskScore ?? null,
+      isActive: false,
+    });
+
+    const altCoords = (alt.waypoints || []).map((w) => [w.lat, w.lon]);
+    if (altCoords.length >= 2) {
+      L.polyline(altCoords, {
+        color: '#ffffff',
+        weight: 6,
+        opacity: 0.6,
+        lineCap: 'round',
+        interactive: false,
+      }).addTo(routeAlternativesLayer);
+
+      const altPoly = L.polyline(altCoords, {
+        color: meta.color,
+        weight: 4,
+        opacity: 0.85,
+        dashArray: '7, 8',
+        lineCap: 'round',
+      });
+
+      altPoly.bindTooltip(
+        `<div style="font-size:11px;"><strong>${meta.icon} ${escapeHtml(meta.label)}</strong><br/>${altDistNm.toFixed(2)} NM · ${altFairwayPct}% fairway<br/><span style="color:#0d9488;font-weight:600;">Click to select this route</span></div>`,
+        { sticky: true }
+      );
+
+      altPoly.on('mouseover', () => {
+        altPoly.setStyle({ weight: 6, opacity: 1.0 });
+      });
+      altPoly.on('mouseout', () => {
+        altPoly.setStyle({ weight: 4, opacity: 0.85 });
+      });
+      altPoly.on('click', () => {
+        selectRouteAlternative(alt.objective);
+      });
+
+      altPoly.addTo(routeAlternativesLayer);
+    }
+  }
+
+  altsBar.innerHTML = `
+    <div class="alternatives-header">
+      <span class="alt-title">Route Alternatives</span>
+      <span class="alt-subtitle">Click to switch</span>
+    </div>
+    <div class="alternatives-list">
+      ${allCards
+        .map(
+          (c) => `
+        <button type="button" class="alt-chip ${c.isActive ? 'active' : ''}" data-obj="${escapeHtml(c.objective)}">
+          <div class="alt-chip-top">
+            <div class="alt-chip-label-wrap">
+              <span class="alt-icon">${c.icon}</span>
+              <span class="alt-label">${escapeHtml(c.label)}</span>
+              ${c.isActive ? '<span class="alt-meta-tag active-badge">ACTIVE</span>' : ''}
+            </div>
+            <span class="alt-dist mono">${c.distanceNm.toFixed(2)} NM</span>
+          </div>
+          <div class="alt-chip-meta">
+            <span class="alt-meta-tag">${c.fairwayPct}% fairway</span>
+            ${c.safetyScore != null ? `<span class="alt-meta-tag ${c.safetyScore >= 80 ? 'safety-high' : ''}">Safety ${Math.round(c.safetyScore)}/100</span>` : ''}
+          </div>
+        </button>
+      `
+        )
+        .join('')}
+    </div>
+  `;
+
+  altsBar.querySelectorAll('.alt-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const obj = btn.getAttribute('data-obj');
+      if (obj && obj !== primaryObjId) {
+        selectRouteAlternative(obj);
+      }
+    });
+  });
 }
 
 async function calculateRoute(opts = {}) {
@@ -2377,6 +2543,11 @@ async function calculateRoute(opts = {}) {
   }
   if (useManual && manualWaypoints && manualWaypoints.length >= 2) {
     query.set('manualWaypoints', manualWaypoints.map((w) => `${w.lat},${w.lon}`).join(';'));
+  }
+  if (opts.targetObjective) {
+    query.set('objectives', `${opts.targetObjective},balanced,fast,safe,fairway`);
+  } else if (Boolean(document.getElementById('routeMultiObjective')?.checked) && !useManual) {
+    query.set('alternatives', '3');
   }
 
   try {
@@ -2920,6 +3091,10 @@ document.getElementById('routeAvoidFaulty').addEventListener('change', () => {
 
 document.getElementById('routeAvoidRocks')?.addEventListener('change', () => {
   scheduleRouteRecalc(200);
+});
+
+document.getElementById('routeMultiObjective')?.addEventListener('change', () => {
+  scheduleRouteRecalc(150);
 });
 
 async function updateRockBadge() {

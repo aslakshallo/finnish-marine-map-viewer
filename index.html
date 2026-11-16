@@ -288,6 +288,10 @@
                   <input type="checkbox" id="routeAnimateSearch" checked />
                   <span class="control-label">Animate search live</span>
                 </label>
+                <label class="control-row mini-row" title="Suggest alternative Pareto-ranked routes (Fast, Safe, Balanced)">
+                  <input type="checkbox" id="routeMultiObjective" checked />
+                  <span class="control-label">Alternatives</span>
+                </label>
                 <label class="control-row mini-row" title="Keep explored A* search tree visible on the map">
                   <input type="checkbox" id="routeKeepSearchTree" />
                   <span class="control-label">Keep tree</span>
@@ -310,6 +314,8 @@
                 <button id="exportGeoJsonBtn" class="tool-chip" title="Export route as GeoJSON" disabled>GeoJSON</button>
               </div>
             </div>
+
+            <div id="routeAlternativesBar" class="route-alternatives-bar hidden"></div>
 
             <div id="routeStatGrid" class="route-stat-grid"></div>
             <div id="routeWarningsList" class="route-warnings-list"></div>
