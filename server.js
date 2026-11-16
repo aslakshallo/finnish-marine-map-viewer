@@ -730,7 +730,7 @@ function scheduleSaveRocks() {
               if (!osmRocksMap.has(id)) osmRocksMap.set(id, r);
             }
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       const obj = {
@@ -1824,6 +1824,133 @@ const ROUTING_MODE_WEIGHTS = {
 
 function getRoutingModeWeights(routingMode) {
   return ROUTING_MODE_WEIGHTS[routingMode] || ROUTING_MODE_WEIGHTS.balanced;
+}
+
+/**
+ * Multi-objective route profiles.
+ * Each profile produces a meaningfully different trade-off between
+ * distance/time, safety margins, and official fairway adherence.
+ */
+const OBJECTIVE_PROFILES = {
+  balanced: {
+    id: 'balanced',
+    label: 'Balanced',
+    description: 'Compromise of distance, safety margins and fairway use',
+    routingMode: 'balanced',
+    clearanceMode: 'normal',
+    shoreMarginBoost: 0,
+    rockBufferBoost: 0,
+    preferVerifiedFairways: false,
+  },
+  fast: {
+    id: 'fast',
+    label: 'Fast / Direct',
+    description: 'Shorter distance; more open-water and tighter clearances allowed',
+    routingMode: 'open_water',
+    clearanceMode: 'tight',
+    shoreMarginBoost: -12,
+    rockBufferBoost: -6,
+    preferVerifiedFairways: false,
+  },
+  safe: {
+    id: 'safe',
+    label: 'Maximum Safety',
+    description: 'Wider margins from shore, rocks and shallow water; prefer deeper routes',
+    routingMode: 'balanced',
+    clearanceMode: 'wide',
+    shoreMarginBoost: 25,
+    rockBufferBoost: 18,
+    preferVerifiedFairways: true,
+  },
+  fairway: {
+    id: 'fairway',
+    label: 'Official Fairways',
+    description: 'Strong preference for verified fairway centreline and channel marks',
+    routingMode: 'strict_fairway',
+    clearanceMode: 'normal',
+    shoreMarginBoost: 8,
+    rockBufferBoost: 8,
+    preferVerifiedFairways: true,
+  },
+};
+
+/**
+ * Compute simple scalar scores for multi-objective comparison / Pareto ranking.
+ * Higher safetyScore and efficiencyScore are better; lower riskScore is better.
+ */
+function scoreRouteResult(summary, totalDistNm, fairwayPct, cautionLegs, faultyMarksNearby, routeFailed) {
+  if (routeFailed) {
+    return {
+      distanceNm: totalDistNm,
+      etaMinutes: summary?.etaMinutes ?? null,
+      fairwayPct: 0,
+      cautionLegs: 99,
+      riskScore: 100,
+      safetyScore: 0,
+      efficiencyScore: 0,
+      composite: 0,
+    };
+  }
+
+  // Risk: caution legs dominate, then low fairway use and faulty marks
+  const riskScore = Math.min(
+    100,
+    cautionLegs * 12 +
+    Math.max(0, 55 - fairwayPct) * 0.55 +
+    (faultyMarksNearby || 0) * 6 +
+    (summary?.usedFallback ? 8 : 0) +
+    (summary?.usedShallowWaterFallback ? 15 : 0)
+  );
+
+  // Safety: inverse of risk, boosted by high fairway adherence
+  const safetyScore = Math.max(0, Math.min(100, 100 - riskScore + fairwayPct * 0.15));
+
+  // Efficiency: shorter is better (normalised later against alternatives)
+  const efficiencyScore = Math.max(0, 100 - totalDistNm * 1.8); // rough for coastal NM scales
+
+  // Composite used only for default ranking when client does not specify preference
+  const composite = safetyScore * 0.45 + efficiencyScore * 0.35 + fairwayPct * 0.2;
+
+  return {
+    distanceNm: Number(totalDistNm.toFixed(2)),
+    etaMinutes: summary?.etaMinutes ?? null,
+    fairwayPct,
+    cautionLegs,
+    riskScore: Number(riskScore.toFixed(1)),
+    safetyScore: Number(safetyScore.toFixed(1)),
+    efficiencyScore: Number(efficiencyScore.toFixed(1)),
+    composite: Number(composite.toFixed(1)),
+  };
+}
+
+/**
+ * Simple Pareto filter: keep routes that are not dominated on (distance, risk).
+ * A route A dominates B if A is no worse on both axes and strictly better on at least one.
+ */
+function filterParetoAlternatives(alts) {
+  if (alts.length <= 1) return alts;
+  const kept = [];
+  for (let i = 0; i < alts.length; i++) {
+    const a = alts[i];
+    if (a.summary?.routeFailed) continue;
+    let dominated = false;
+    for (let j = 0; j < alts.length; j++) {
+      if (i === j) continue;
+      const b = alts[j];
+      if (b.summary?.routeFailed) continue;
+      const aDist = a.scores.distanceNm;
+      const bDist = b.scores.distanceNm;
+      const aRisk = a.scores.riskScore;
+      const bRisk = b.scores.riskScore;
+      if (bDist <= aDist && bRisk <= aRisk && (bDist < aDist || bRisk < aRisk)) {
+        dominated = true;
+        break;
+      }
+    }
+    if (!dominated) kept.push(a);
+  }
+  // Always keep at least the primary if everything was filtered
+  return kept.length > 0 ? kept : alts.slice(0, 1);
 }
 
 function parseLatLonList(raw, maxItems = 15) {
@@ -3878,6 +4005,35 @@ async function computeMarineRoute(params) {
   const manualPts = parseLatLonList(params.get('manualWaypoints'), 250);
   const recordTrace = params.get('trace') === '1';
 
+  // Multi-objective / Pareto alternatives
+  // alternatives=2|3  or  objectives=balanced,fast,safe  (max 3)
+  let requestedObjectives = [];
+  const rawObjectives = (params.get('objectives') || '').trim();
+  if (rawObjectives) {
+    requestedObjectives = rawObjectives
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((id) => OBJECTIVE_PROFILES[id])
+      .slice(0, 3);
+  }
+  const altCount = Math.max(1, Math.min(3, Number(params.get('alternatives')) || 0));
+  if (requestedObjectives.length === 0 && altCount > 1) {
+    // Sensible default set when only a count is given
+    requestedObjectives = ['balanced', 'fast', 'safe'].slice(0, altCount);
+  }
+  if (requestedObjectives.length === 0) {
+    // Single primary route — map user routingMode/clearance to a profile id when possible
+    const primaryId =
+      routingMode === 'strict_fairway'
+        ? 'fairway'
+        : routingMode === 'open_water'
+          ? 'fast'
+          : clearanceMode === 'wide'
+            ? 'safe'
+            : 'balanced';
+    requestedObjectives = [primaryId];
+  }
+
   if (![startLat, startLon, endLat, endLon].every(Number.isFinite) && manualPts.length >= 2) {
     startLat = manualPts[0].lat;
     startLon = manualPts[0].lon;
@@ -3946,43 +4102,33 @@ async function computeMarineRoute(params) {
   };
   const baseClearance = clearancePresets[clearanceMode] || clearancePresets.normal;
 
-  let usedFallback = false;
-  let usedShallowWaterFallback = false;
-  let routeFailed = false;
-  let waypointsXY = [];
-  const debugSegments = [];
-  const debugMapMarkers = [];
-  const failureExplanations = [];
+  // Multi-objective: we may run several independent searches that share the
+  // expensive corridor data + spatial indexes. Each profile gets its own
+  // clearance buffers, routingMode weights and shore/rock margins.
+  const multiObjective = requestedObjectives.length > 1 && manualPts.length < 2;
 
-  if (manualPts.length >= 2) {
-    waypointsXY = manualPts.map((pt, i) => {
-      const [x, y] = project.toXY(pt.lat, pt.lon);
-      const onFw = Boolean(pointOnSafeFairway(x, y, index, 28, true));
-      const role = i === 0 ? 'start' : i === manualPts.length - 1 ? 'end' : 'manual';
-      return {
-        x,
-        y,
-        kind: role,
-        role,
-        viaIndex: null,
-        segIdx: Math.min(i, Math.max(0, manualPts.length - 2)),
-        onFairway: onFw,
-      };
-    });
-    if (turnRadiusM > 0) {
-      const manualEvalOpts = {
-        contourBuffer: baseClearance.contourBuffer,
-        soundingBuffer: baseClearance.soundingBuffer,
-        shoreBuffer: shoreMarginM,
-        rockBuffer: avoidRocks ? baseClearance.rockBuffer : 0,
-        routingMode: 'open_water',
-        avoidFaulty,
-        allowShallowWater: true,
-        turnRadiusM,
-      };
-      waypointsXY = roundSharpCorners(waypointsXY, index, manualEvalOpts);
-    }
-  } else {
+  // Helper that runs the full stop-chain path search for one objective profile.
+  // Returns the same intermediate state the original single-path code produced.
+  function runObjectiveSearch(profile) {
+    const rm = profile.routingMode || routingMode;
+    const cm = profile.clearanceMode || clearanceMode;
+    const baseClearance = clearancePresets[cm] || clearancePresets.normal;
+    const localShoreMargin = Math.max(
+      0,
+      Math.min(150, shoreMarginM + (profile.shoreMarginBoost || 0))
+    );
+    const localRockBuf = avoidRocks
+      ? Math.max(0, baseClearance.rockBuffer + (profile.rockBufferBoost || 0))
+      : 0;
+
+    let usedFallback = false;
+    let usedShallowWaterFallback = false;
+    let routeFailed = false;
+    let waypointsXY = [];
+    const debugSegments = [];
+    const debugMapMarkers = [];
+    const failureExplanations = [];
+
     const stops = [{ lat: startLat, lon: startLon }, ...viaPoints, { lat: endLat, lon: endLon }];
     const [bboxMinX, bboxMinY] = project.toXY(corridorData.bbox[0], corridorData.bbox[1]);
     const [bboxMaxX, bboxMaxY] = project.toXY(corridorData.bbox[2], corridorData.bbox[3]);
@@ -4004,24 +4150,24 @@ async function computeMarineRoute(params) {
           label: 'Normal clearance',
           contourBuffer: baseClearance.contourBuffer,
           soundingBuffer: baseClearance.soundingBuffer,
-          shoreBuffer: shoreMarginM,
-          rockBuffer: avoidRocks ? baseClearance.rockBuffer : 0,
+          shoreBuffer: localShoreMargin,
+          rockBuffer: localRockBuf,
           relaxFactor: baseClearance.relaxFactor,
           allowShallowFairways: false,
           allowShallowWater: false,
-          routingMode,
+          routingMode: rm,
           avoidFaulty,
         },
         {
           label: 'Relaxed + shallow fairways',
           contourBuffer: Math.min(8, Math.round(baseClearance.contourBuffer * 0.5)),
           soundingBuffer: Math.min(12, Math.round(baseClearance.soundingBuffer * 0.55)),
-          shoreBuffer: Math.min(12, Math.round(shoreMarginM * 0.5)),
-          rockBuffer: avoidRocks ? Math.min(10, Math.round(baseClearance.rockBuffer * 0.5)) : 0,
+          shoreBuffer: Math.min(12, Math.round(localShoreMargin * 0.5)),
+          rockBuffer: avoidRocks ? Math.min(10, Math.round(localRockBuf * 0.5)) : 0,
           relaxFactor: Math.min(0.7, baseClearance.relaxFactor * 0.7),
           allowShallowFairways: true,
           allowShallowWater: false,
-          routingMode,
+          routingMode: rm,
           avoidFaulty,
         },
         {
@@ -4033,7 +4179,7 @@ async function computeMarineRoute(params) {
           relaxFactor: 0.5,
           allowShallowFairways: true,
           allowShallowWater: true,
-          routingMode,
+          routingMode: rm,
           avoidFaulty,
         },
       ];
@@ -4178,73 +4324,6 @@ async function computeMarineRoute(params) {
         }
         failureExplanations.push(failureExplanation);
 
-        const pushAnchorMarker = (idx, pt, isStart, pointBlocked, anchorInfo) => {
-          const roleLabel =
-            idx === 0 ? 'Start (A)' : idx === stops.length - 1 ? 'Dest (B)' : `Via V${idx}`;
-          const r = pointBlocked?.blocked ? pointBlocked.reason : anchorInfo?.blockReason || 'anchor-blocked';
-          const distNote =
-            anchorInfo?.nearestNodeDistM != null
-              ? ` Nearest open node is ${anchorInfo.nearestNodeDistM} m away (limit ${anchorInfo.maxSearchDistM} m).`
-              : '';
-          debugMapMarkers.push({
-            kind: 'anchor-blocked',
-            segIdx,
-            lat: Number(pt.lat.toFixed(6)),
-            lon: Number(pt.lon.toFixed(6)),
-            label: `${roleLabel} Blocked`,
-            reason: r,
-            detail: `${roleLabel} ${isStart ? 'start' : 'destination'} anchor blocked by ${r}.${distNote}`,
-          });
-        };
-
-        if (lastDiag.startPointBlocked?.blocked || fc === 'start-anchor-blocked' || fc === 'both-anchors-blocked') {
-          pushAnchorMarker(segIdx, stops[segIdx], true, lastDiag.startPointBlocked, lastDiag.startAnchorInfo);
-        }
-        if (lastDiag.endPointBlocked?.blocked || fc === 'end-anchor-blocked' || fc === 'both-anchors-blocked') {
-          pushAnchorMarker(segIdx + 1, stops[segIdx + 1], false, lastDiag.endPointBlocked, lastDiag.endAnchorInfo);
-        }
-        if (
-          farthestReached &&
-          lastDiag.closestNodeXY &&
-          Math.hypot(lastDiag.closestNodeXY[0] - segStartXY[0], lastDiag.closestNodeXY[1] - segStartXY[1]) > 60
-        ) {
-          debugMapMarkers.push({
-            kind: 'farthest-reached',
-            segIdx,
-            lat: farthestReached.lat,
-            lon: farthestReached.lon,
-            toLat: Number(stops[segIdx + 1].lat.toFixed(6)),
-            toLon: Number(stops[segIdx + 1].lon.toFixed(6)),
-            label: 'A* Frontier',
-            reason: fc,
-            detail: `Explored ${lastDiag.visitedNodes} nodes; stopped ${(lastDiag.remainingDistToGoalM / 1852).toFixed(2)} NM (${lastDiag.remainingDistToGoalM} m) from destination`,
-          });
-        }
-
-        const combinedObs = [...(frontierCheck?.obstructions || []), ...(directLineCheck?.obstructions || [])];
-        const addedObs = [];
-        for (const obs of combinedObs) {
-          if (addedObs.length >= 4) break;
-          const tooClose = addedObs.some((ex) => {
-            if (ex.reason !== obs.reason) return false;
-            const dLatM = (obs.lat - ex.lat) * 111132;
-            const dLonM = (obs.lon - ex.lon) * mPerDegLon;
-            return Math.hypot(dLatM, dLonM) < 120;
-          });
-          if (tooClose) continue;
-          addedObs.push(obs);
-          debugMapMarkers.push({
-            kind: 'obstruction',
-            segIdx,
-            lat: obs.lat,
-            lon: obs.lon,
-            label: `Blocked: ${obs.reason}`,
-            reason: obs.reason,
-            detail: obs.detail,
-            distFromStartM: obs.distFromStartM,
-          });
-        }
-
         segPts = [
           { x: segStartXY[0], y: segStartXY[1], kind: 'direct', onFairway: false },
           { x: segEndXY[0], y: segEndXY[1], kind: 'direct', onFairway: false },
@@ -4305,6 +4384,114 @@ async function computeMarineRoute(params) {
         });
       }
     }
+
+    return {
+      profile,
+      waypointsXY,
+      debugSegments,
+      debugMapMarkers,
+      failureExplanations,
+      usedFallback,
+      usedShallowWaterFallback,
+      routeFailed,
+      routingModeUsed: rm,
+      clearanceModeUsed: cm,
+      shoreMarginUsed: localShoreMargin,
+    };
+  }
+
+  // ---------- Primary (and optional multi-objective) search ----------
+  let usedFallback = false;
+  let usedShallowWaterFallback = false;
+  let routeFailed = false;
+  let waypointsXY = [];
+  const debugSegments = [];
+  const debugMapMarkers = [];
+  const failureExplanations = [];
+  let primarySearchResult = null;
+  const objectiveSearchResults = [];
+
+  if (manualPts.length >= 2) {
+    const baseClearance = clearancePresets[clearanceMode] || clearancePresets.normal;
+    waypointsXY = manualPts.map((pt, i) => {
+      const [x, y] = project.toXY(pt.lat, pt.lon);
+      const onFw = Boolean(pointOnSafeFairway(x, y, index, 28, true));
+      const role = i === 0 ? 'start' : i === manualPts.length - 1 ? 'end' : 'manual';
+      return {
+        x,
+        y,
+        kind: role,
+        role,
+        viaIndex: null,
+        segIdx: Math.min(i, Math.max(0, manualPts.length - 2)),
+        onFairway: onFw,
+      };
+    });
+    if (turnRadiusM > 0) {
+      const manualEvalOpts = {
+        contourBuffer: baseClearance.contourBuffer,
+        soundingBuffer: baseClearance.soundingBuffer,
+        shoreBuffer: shoreMarginM,
+        rockBuffer: avoidRocks ? baseClearance.rockBuffer : 0,
+        routingMode: 'open_water',
+        avoidFaulty,
+        allowShallowWater: true,
+        turnRadiusM,
+      };
+      waypointsXY = roundSharpCorners(waypointsXY, index, manualEvalOpts);
+    }
+    // Manual routes do not participate in multi-objective search
+    primarySearchResult = {
+      profile: OBJECTIVE_PROFILES.balanced || { id: 'manual', label: 'Manual', description: 'User-drawn route' },
+      waypointsXY,
+      debugSegments: [],
+      debugMapMarkers: [],
+      failureExplanations: [],
+      usedFallback: false,
+      usedShallowWaterFallback: false,
+      routeFailed: false,
+      routingModeUsed: 'open_water',
+      clearanceModeUsed: clearanceMode,
+      shoreMarginUsed: shoreMarginM,
+    };
+  } else if (multiObjective) {
+    // Run independent searches for each requested objective, sharing the spatial index
+    for (const objId of requestedObjectives) {
+      const profile = OBJECTIVE_PROFILES[objId] || OBJECTIVE_PROFILES.balanced;
+      const result = runObjectiveSearch(profile);
+      objectiveSearchResults.push(result);
+    }
+    // Primary = first requested objective
+    primarySearchResult = objectiveSearchResults[0];
+    waypointsXY = primarySearchResult.waypointsXY;
+    usedFallback = primarySearchResult.usedFallback;
+    usedShallowWaterFallback = primarySearchResult.usedShallowWaterFallback;
+    routeFailed = primarySearchResult.routeFailed;
+    debugSegments.push(...primarySearchResult.debugSegments);
+    debugMapMarkers.push(...primarySearchResult.debugMapMarkers);
+    failureExplanations.push(...primarySearchResult.failureExplanations);
+  } else {
+    // Single-objective path (original behaviour)
+    const profile = OBJECTIVE_PROFILES[requestedObjectives[0]] || {
+      id: 'custom',
+      label: 'Custom',
+      description: 'User-specified routingMode / clearanceMode',
+      routingMode,
+      clearanceMode,
+      shoreMarginBoost: 0,
+      rockBufferBoost: 0,
+    };
+    // Honour explicit user routingMode / clearanceMode over profile defaults
+    profile.routingMode = routingMode;
+    profile.clearanceMode = clearanceMode;
+    primarySearchResult = runObjectiveSearch(profile);
+    waypointsXY = primarySearchResult.waypointsXY;
+    usedFallback = primarySearchResult.usedFallback;
+    usedShallowWaterFallback = primarySearchResult.usedShallowWaterFallback;
+    routeFailed = primarySearchResult.routeFailed;
+    debugSegments.push(...primarySearchResult.debugSegments);
+    debugMapMarkers.push(...primarySearchResult.debugMapMarkers);
+    failureExplanations.push(...primarySearchResult.failureExplanations);
   }
 
   // Convert to geographic legs and generate seamark pass instructions
@@ -4491,6 +4678,111 @@ async function computeMarineRoute(params) {
     mapMarkers: debugMapMarkers,
   };
 
+  // Primary scores for multi-objective comparison
+  const primaryScores = scoreRouteResult(
+    { etaMinutes, usedFallback, usedShallowWaterFallback },
+    totalDistNm,
+    fairwayPct,
+    cautionLegs,
+    faultyMarksNearby,
+    routeFailed
+  );
+
+  // Build alternative route summaries (geometry + scores) when multi-objective was requested
+  const alternatives = [];
+  if (multiObjective && objectiveSearchResults.length > 1) {
+    for (let ai = 0; ai < objectiveSearchResults.length; ai++) {
+      const osr = objectiveSearchResults[ai];
+      const altWaypoints = osr.waypointsXY.map((wp, idx) => {
+        const [lat, lon] = project.toLatLon(wp.x, wp.y);
+        return {
+          index: idx,
+          lat: Number(lat.toFixed(6)),
+          lon: Number(lon.toFixed(6)),
+          role: wp.role || (idx === 0 ? 'start' : idx === osr.waypointsXY.length - 1 ? 'end' : 'auto'),
+          viaIndex: wp.viaIndex ?? null,
+          segIdx: wp.segIdx ?? 0,
+        };
+      });
+
+      let altDistM = 0;
+      let altFairwayDistM = 0;
+      let altCautionLegs = 0;
+      for (let i = 0; i < osr.waypointsXY.length - 1; i++) {
+        const a = osr.waypointsXY[i];
+        const b = osr.waypointsXY[i + 1];
+        const d = Math.hypot(b.x - a.x, b.y - a.y);
+        altDistM += d;
+        const fw = segmentNearSafeFairway(a.x, a.y, b.x, b.y, index, 10, true);
+        if (fw) altFairwayDistM += d;
+        const ev = evaluateSegment(a.x, a.y, b.x, b.y, index, {
+          contourBuffer: 10,
+          soundingBuffer: 14,
+          relaxFactor: 0.75,
+          routingMode: osr.routingModeUsed,
+          avoidFaulty,
+        });
+        if (ev.blocked || (fw && fw.fairwayDepth != null && fw.fairwayDepth < effectiveSafeDepth)) {
+          altCautionLegs++;
+        }
+      }
+      const altDistNm = altDistM / 1852;
+      const altFairwayPct = altDistM > 0 ? Math.round((altFairwayDistM / altDistM) * 100) : 0;
+      const altEta = Math.round((altDistNm / speedKn) * 60);
+      const altScores = scoreRouteResult(
+        {
+          etaMinutes: altEta,
+          usedFallback: osr.usedFallback,
+          usedShallowWaterFallback: osr.usedShallowWaterFallback,
+        },
+        altDistNm,
+        altFairwayPct,
+        altCautionLegs,
+        0,
+        osr.routeFailed
+      );
+
+      alternatives.push({
+        objective: osr.profile.id,
+        label: osr.profile.label,
+        description: osr.profile.description,
+        isPrimary: ai === 0,
+        routingMode: osr.routingModeUsed,
+        clearanceMode: osr.clearanceModeUsed,
+        scores: altScores,
+        route: {
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates: altWaypoints.map((w) => [w.lon, w.lat]),
+          },
+          properties: {
+            totalDistM: Math.round(altDistM),
+            totalDistNm: Number(altDistNm.toFixed(2)),
+            etaMinutes: altEta,
+            fairwayPct: altFairwayPct,
+            effectiveSafeDepth,
+            objective: osr.profile.id,
+          },
+        },
+        waypoints: altWaypoints,
+        summary: {
+          totalDistM: Math.round(altDistM),
+          totalDistNm: Number(altDistNm.toFixed(2)),
+          etaMinutes: altEta,
+          fairwayPct: altFairwayPct,
+          cautionLegs: altCautionLegs,
+          usedFallback: osr.usedFallback,
+          routeFailed: osr.routeFailed,
+        },
+      });
+    }
+  }
+
+  // Keep only non-dominated alternatives when we have a real set
+  const paretoAlternatives =
+    alternatives.length > 1 ? filterParetoAlternatives(alternatives) : alternatives;
+
   return {
     params: {
       startLat,
@@ -4513,7 +4805,11 @@ async function computeMarineRoute(params) {
       turnRadiusM: Math.round(turnRadiusM),
       vias: viaPoints,
       isManual: manualPts.length >= 2,
+      objectives: requestedObjectives,
+      multiObjective,
     },
+    objective: primarySearchResult?.profile?.id || requestedObjectives[0] || 'balanced',
+    scores: primaryScores,
     route: {
       type: 'Feature',
       geometry: {
@@ -4526,6 +4822,7 @@ async function computeMarineRoute(params) {
         etaMinutes,
         fairwayPct,
         effectiveSafeDepth,
+        objective: primarySearchResult?.profile?.id || requestedObjectives[0] || 'balanced',
       },
     },
     waypoints,
@@ -4552,6 +4849,23 @@ async function computeMarineRoute(params) {
       },
       debug,
     },
+    // Multi-objective / Pareto set (empty when only a single route was requested)
+    alternatives: paretoAlternatives,
+    objectiveComparison:
+      paretoAlternatives.length > 1
+        ? paretoAlternatives.map((a) => ({
+          objective: a.objective,
+          label: a.label,
+          distanceNm: a.scores.distanceNm,
+          etaMinutes: a.scores.etaMinutes,
+          fairwayPct: a.scores.fairwayPct,
+          riskScore: a.scores.riskScore,
+          safetyScore: a.scores.safetyScore,
+          efficiencyScore: a.scores.efficiencyScore,
+          composite: a.scores.composite,
+          routeFailed: a.summary.routeFailed,
+        }))
+        : undefined,
   };
 }
 
