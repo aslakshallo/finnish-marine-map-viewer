@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.bak
+
+# Temporary scripts & scratch files
+scratch/
+*.log
+screenshot*.png
+sidebar_*.png

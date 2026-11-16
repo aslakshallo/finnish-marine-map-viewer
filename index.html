@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Luotsi — Finnish Marine &amp; Outdoor Open Data Map Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 28 28" width="22" height="22" fill="none">
+          <circle cx="14" cy="14" r="11.5" stroke="currentColor" stroke-width="1.8" />
+          <path d="M14 4.5L17.2 14L14 23.5L10.8 14L14 4.5Z" fill="#0d6e8a" />
+          <path d="M14 4.5L17.2 14H10.8L14 4.5Z" fill="#e05a3a" />
+          <circle cx="14" cy="14" r="1.8" fill="#ffffff" />
+        </svg>
+      </div>
+      <div class="brand-text">
+        <span class="brand-title">Route manager</span>
+        <span class="brand-subtitle"></span>
+      </div>
+    </div>
+
+    <nav class="presets" aria-label="Quick region presets">
+      <button class="preset-btn active" data-lat="60.135" data-lon="24.96" data-zoom="11">Helsinki</button>
+      <button class="preset-btn" data-lat="60.4030" data-lon="26.2600" data-zoom="17">Valko</button>
+    </nav>
+
+    <div class="topbar-actions">
+      <button id="routeModeBtn" class="action-btn" title="Plan an automatic depth &amp; seamark-aware boat route">
+        <span> Route Planner</span>
+      </button>
+
+      <button id="weatherInspectBtn" class="action-btn"
+        title="Click any spot on the map to inspect Open-Meteo wind &amp; weather">
+        <span class="dot-indicator"></span>
+        <span>Inspect Weather</span>
+      </button>
+
+      <button id="seaLevelPill" class="weather-pill sealevel-pill"
+        title="Nearest FMI Mareograph sea level (click to zoom to station)">
+        <span id="seaLevelSummary">Sea Level: ...</span>
+      </button>
+
+      <button id="weatherPill" class="weather-pill" title="Open 24h Open-Meteo marine forecast">
+        <span id="weatherSummary">Loading Open-Meteo...</span>
+      </button>
+
+      <button id="licensesBtn" class="action-btn primary-outline">Data &amp; Licenses</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside id="sidebar" class="sidebar" aria-label="Marine navigation and chart layers">
+      <!-- Top View Switcher Tabs -->
+      <nav class="sidebar-tabs" role="tablist" aria-label="Sidebar views">
+        <button type="button" id="tabNavBtn" class="sidebar-tab active" data-tab="route" role="tab" aria-selected="true" aria-controls="panelRoute">
+          <span class="tab-icon">🧭</span>
+          <span class="tab-label">Route</span>
+          <span id="routeActiveIndicator" class="tab-indicator hidden" title="Route active">•</span>
+        </button>
+        <button type="button" id="tabLayersBtn" class="sidebar-tab" data-tab="layers" role="tab" aria-selected="false" aria-controls="panelLayers">
+          <span class="tab-icon">🗺️</span>
+          <span class="tab-label">Layers</span>
+        </button>
+        <button id="sidebarToggleInside" class="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar">
+          &lsaquo;
+        </button>
+      </nav>
+
+      <!-- VIEW 1: ROUTE PLANNER -->
+      <div id="panelRoute" class="sidebar-panel active" role="tabpanel" aria-labelledby="tabNavBtn">
+        <div class="panel-header">
+          <div class="panel-title-wrap">
+            <span class="panel-title">Pathfinder</span>
+            <span class="source-tag">Auto + Manual</span>
+          </div>
+          <div class="panel-header-actions">
+            <button id="demoRouteBtn" class="text-btn demo-btn" title="Load sample Helsinki archipelago route">Demo</button>
+          </div>
+        </div>
+
+        <div class="sidebar-scroll">
+          <!-- CARD 1: Waypoints & Mode -->
+          <div class="sidebar-card primary-card">
+            <div class="card-header">
+              <span class="card-title">1. Waypoints &amp; Mode</span>
+              <div class="route-mode-switcher" role="tablist" aria-label="Route planning mode">
+                <button type="button" id="routeModeAutoBtn" class="route-mode-tab active" title="Automatic marine routing through fairways &amp; safe depths">
+                  Auto
+                </button>
+                <button type="button" id="routeModeManualBtn" class="route-mode-tab" title="Draw custom route waypoints by hand directly on the chart">
+                  Manual
+                </button>
+              </div>
+            </div>
+
+            <!-- Auto Route picking controls -->
+            <div id="autoRouteControls" class="route-pick-grid">
+              <button id="setRouteStartBtn" class="route-step-btn start" title="Click on map to place Start (A)">
+                <span class="step-dot green"></span>
+                <span class="step-label">Start (A)</span>
+              </button>
+              <button id="setRouteViaBtn" class="route-step-btn via" title="Click on map to add an intermediate Via-Point">
+                <span class="step-dot yellow">+</span>
+                <span class="step-label">Via</span>
+              </button>
+              <button id="setRouteEndBtn" class="route-step-btn dest" title="Click on map to place Destination (B)">
+                <span class="step-dot red"></span>
+                <span class="step-label">Dest (B)</span>
+              </button>
+              <button id="reverseRouteBtn" class="route-step-btn reverse" title="Reverse route (swap Start &amp; Destination)" disabled>
+                <span>&#8644;</span>
+              </button>
+            </div>
+
+            <!-- Manual Route drawing controls -->
+            <div id="manualRouteControls" class="route-pick-grid manual hidden">
+              <button type="button" id="drawManualBtn" class="route-step-btn active" title="Click anywhere on the chart to add waypoints">
+                + Points
+              </button>
+              <button type="button" id="finishManualBtn" class="route-step-btn primary" title="Finish placing points and evaluate route">
+                ✓ Done
+              </button>
+              <button type="button" id="undoManualPtBtn" class="route-step-btn" title="Remove the last placed waypoint">
+                &#8630; Undo
+              </button>
+              <button type="button" id="reverseManualBtn" class="route-step-btn" title="Reverse manual route" disabled>
+                &#8644;
+              </button>
+            </div>
+
+            <!-- Primary Calculate CTA -->
+            <div class="route-action-row">
+              <button id="calcRouteBtn" class="calc-route-cta" disabled>
+                <span class="cta-icon">⚡</span>
+                <span class="cta-text">Calculate Route</span>
+              </button>
+              <button id="clearRouteBtn" class="route-clear-btn" title="Clear current route" disabled>
+                Clear
+              </button>
+            </div>
+
+            <div id="routeStatusText" class="route-status-text hidden"></div>
+          </div>
+
+          <!-- CARD 2: Vessel & Safety Limits -->
+          <div class="sidebar-card">
+            <div class="card-header">
+              <span class="card-title">2. Vessel Profile &amp; Water Level</span>
+            </div>
+
+            <div class="vessel-grid">
+              <label class="vessel-input-cell" for="routeDraftM" title="Vessel static draft (meters)">
+                <span class="cell-label">Draft</span>
+                <div class="cell-input-wrap">
+                  <input type="number" id="routeDraftM" class="route-num-input mono" min="0.3" max="18" step="0.1" value="1" />
+                  <span class="cell-unit">m</span>
+                </div>
+              </label>
+              <label class="vessel-input-cell" for="routeUkcM" title="Under-keel clearance safety margin (meters)">
+                <span class="cell-label">UKC Margin</span>
+                <div class="cell-input-wrap">
+                  <input type="number" id="routeUkcM" class="route-num-input mono" min="0.0" max="5.0" step="0.1" value="0.5" />
+                  <span class="cell-unit">m</span>
+                </div>
+              </label>
+              <label class="vessel-input-cell" for="routeSpeedKn" title="Cruising speed for ETA calculations (knots)">
+                <span class="cell-label">Speed</span>
+                <div class="cell-input-wrap">
+                  <input type="number" id="routeSpeedKn" class="route-num-input mono" min="3" max="35" step="1" value="12" />
+                  <span class="cell-unit">kn</span>
+                </div>
+              </label>
+            </div>
+
+            <div class="safe-depth-banner">
+              <label class="control-row mini-row">
+                <input type="checkbox" id="routeUseSeaLevel" checked />
+                <span class="control-label">Live FMI sea level</span>
+              </label>
+              <span id="routeSafeDepthBadge" class="mono threshold-badge" title="Required chart depth: Draft + UKC minus live FMI sea level offset">
+                D_safe = 3.0 m
+              </span>
+            </div>
+          </div>
+
+          <!-- CARD 3: Navigation Preferences & Margins (Collapsible) -->
+          <details class="sidebar-card collapsible-card" open>
+            <summary class="card-header clickable">
+              <span class="card-title">3. Clearances &amp; Margins</span>
+              <span class="fold-icon">▾</span>
+            </summary>
+
+            <div class="card-body">
+              <div class="form-row">
+                <label class="form-label" for="routePrefMode">Routing Preference</label>
+                <select id="routePrefMode" class="compact-select" aria-label="Routing preference">
+                  <option value="balanced" selected>Balanced (Fairways + Open Water)</option>
+                  <option value="strict_fairway">Strict Fairway Priority</option>
+                  <option value="open_water">Direct Open Water</option>
+                </select>
+              </div>
+
+              <div class="form-row">
+                <label class="form-label" for="routeClearanceMode">Shoal Clearance Margin</label>
+                <select id="routeClearanceMode" class="compact-select" aria-label="Lateral shoal clearance">
+                  <option value="normal" selected>Normal (16 m contour buffer)</option>
+                  <option value="tight">Tight Archipelago (8 m buffer)</option>
+                  <option value="wide">Wide Margin (28 m buffer)</option>
+                </select>
+              </div>
+
+              <div class="form-row">
+                <label class="form-label" for="routeEditMode">Interactive Edit Mode</label>
+                <select id="routeEditMode" class="compact-select" aria-label="Waypoint drag and click mode">
+                  <option value="via" selected>Drag/Click &rarr; Add Via-Point (Auto-Reroute)</option>
+                  <option value="manual">Drag/Click &rarr; Move Vertex Directly (Manual)</option>
+                </select>
+              </div>
+
+              <div class="section-divider"></div>
+
+              <!-- Hazard Toggles -->
+              <div class="hazard-toggles-group">
+                <label class="control-row mini-row" title="Avoid S-57 charted marine rocks, underwater hazards, shoals and islets on open waters outside fairways">
+                  <input type="checkbox" id="routeAvoidRocks" checked />
+                  <span class="control-label">Avoid S-57 charted rocks <span class="badge" id="rocksCountBadge">168k rocks</span></span>
+                </label>
+
+                <label class="control-row mini-row" title="Extra keep-out radius around reported faulty buoys and unlit marks">
+                  <input type="checkbox" id="routeAvoidFaulty" checked />
+                  <span class="control-label">Extra buffer around faulty ATON marks</span>
+                </label>
+              </div>
+
+              <div class="section-divider"></div>
+
+              <!-- Margins & Geometry -->
+              <div class="margin-inputs-grid">
+                <div class="margin-row" title="Keep to Starboard or Port side of the fairway centerline">
+                  <label class="margin-label" for="routeFairwayOffsetSide">Fairway Offset</label>
+                  <div class="margin-input-combo">
+                    <select id="routeFairwayOffsetSide" class="compact-select" aria-label="Fairway lateral offset side">
+                      <option value="center" selected>Center</option>
+                      <option value="starboard">Starboard</option>
+                      <option value="port">Port</option>
+                    </select>
+                    <div class="num-unit-wrap">
+                      <input type="number" id="routeFairwayOffsetM" class="route-num-input mono" min="0" max="100" step="5" value="0" />
+                      <span class="unit-tag">m</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="margin-row" title="Minimum distance (meters) to keep away from dry land and island shorelines outside official fairways">
+                  <label class="margin-label" for="routeShoreMarginM">Shoreline Margin</label>
+                  <div class="num-unit-wrap">
+                    <input type="number" id="routeShoreMarginM" class="route-num-input mono" min="0" max="150" step="5" value="15" />
+                    <span class="unit-tag">m</span>
+                  </div>
+                </div>
+
+                <div class="margin-row" title="Radius (meters) for gentle nautical turn filleting at fairway corners">
+                  <label class="margin-label" for="routeTurnRadiusM">Turn Radius</label>
+                  <div class="num-unit-wrap">
+                    <input type="number" id="routeTurnRadiusM" class="route-num-input mono" min="0" max="500" step="10" value="100" />
+                    <span class="unit-tag">m</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="section-divider"></div>
+
+              <!-- Diagnostics & Animation -->
+              <div class="search-options-row">
+                <label class="control-row mini-row" title="Animate the A* pathfinder exploring fairways and open-water grid cells">
+                  <input type="checkbox" id="routeAnimateSearch" checked />
+                  <span class="control-label">Animate search live</span>
+                </label>
+                <label class="control-row mini-row" title="Keep explored A* search tree visible on the map">
+                  <input type="checkbox" id="routeKeepSearchTree" />
+                  <span class="control-label">Keep tree</span>
+                </label>
+              </div>
+
+              <div class="replay-debug-actions">
+                <button id="replayRouteSearchBtn" class="route-tool-btn" title="Replay pathfinder search animation" disabled>&#9654; Replay Search</button>
+                <button id="copyRouteDebugBtn" class="route-tool-btn" title="Copy route debug report to clipboard" disabled>&#128203; Copy Debug</button>
+              </div>
+            </div>
+          </details>
+
+          <!-- CARD 4: Route Output & Waypoints (Shown when route exists) -->
+          <div id="routeSummaryBox" class="sidebar-card output-card hidden">
+            <div class="card-header">
+              <span class="card-title">Route Summary</span>
+              <div class="route-export-tools">
+                <button id="exportGpxBtn" class="tool-chip" title="Export route as GPX 1.1" disabled>GPX</button>
+                <button id="exportGeoJsonBtn" class="tool-chip" title="Export route as GeoJSON" disabled>GeoJSON</button>
+              </div>
+            </div>
+
+            <div id="routeStatGrid" class="route-stat-grid"></div>
+            <div id="routeWarningsList" class="route-warnings-list"></div>
+
+            <div class="route-manage-bar">
+              <button id="undoRouteEditBtn" class="route-tool-btn" title="Undo last route edit" disabled>&#8630; Undo Edit</button>
+              <button id="resetRouteEditsBtn" class="route-tool-btn" title="Clear Via-Points and manual edits" disabled>&#8634; Reset Auto</button>
+              <button id="importRouteBtn" class="route-tool-btn" title="Import a .gpx or .geojson route">&#8679; Import</button>
+              <input type="file" id="importRouteFileInput" accept=".gpx,.geojson,.json" class="hidden" />
+            </div>
+
+            <details id="routeDebugDetails" class="route-debug-details hidden">
+              <summary class="route-debug-summary">
+                <span id="routeDebugSummaryLabel">Diagnostics Log</span>
+                <button type="button" id="copyRouteDebugInlineBtn" class="route-debug-copy-btn" title="Copy full debug report to clipboard">Copy</button>
+              </summary>
+              <div id="routeDebugBody" class="route-debug-body"></div>
+            </details>
+
+            <div class="route-legs-section">
+              <div class="route-legs-header">Turn-by-Turn Waypoints</div>
+              <div id="routeLegsList" class="route-legs-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 2: MAP LAYERS & OVERLAYS -->
+      <div id="panelLayers" class="sidebar-panel" role="tabpanel" aria-labelledby="tabLayersBtn">
+        <div class="panel-header">
+          <div class="panel-title-wrap">
+            <span class="panel-title">Chart Layers</span>
+            <span class="source-tag">WMS / WMTS</span>
+          </div>
+          <div class="panel-header-actions">
+            <button id="allLayersOnBtn" class="text-btn" title="Enable all marine data layers">All On</button>
+            <span class="header-sep">&middot;</span>
+            <button id="allLayersOffBtn" class="text-btn" title="Turn off all data layers">All Off</button>
+          </div>
+        </div>
+
+        <div class="sidebar-scroll">
+          <!-- SECTION 1: Base Map -->
+          <section class="layer-group">
+            <details open>
+              <summary class="group-title">
+                <span class="title-with-icon">🗺️ Base Map</span>
+                <span class="source-tag">MML / OSM</span>
+              </summary>
+              <div class="group-body">
+                <label class="control-row radio">
+                  <input type="radio" name="basemap" value="mml-tausta" checked />
+                  <span class="control-label">Maanmittauslaitos Background (Taustakartta)</span>
+                </label>
+                <label class="control-row radio">
+                  <input type="radio" name="basemap" value="mml-perus" />
+                  <span class="control-label">Maanmittauslaitos Topographic (Peruskartta)</span>
+                </label>
+                <label class="control-row radio">
+                  <input type="radio" name="basemap" value="mml-orto" />
+                  <span class="control-label">Maanmittauslaitos Aerial Photo (Ortokuva)</span>
+                </label>
+                <label class="control-row radio">
+                  <input type="radio" name="basemap" value="osm" />
+                  <span class="control-label">OpenStreetMap Standard</span>
+                </label>
+              </div>
+            </details>
+          </section>
+
+          <!-- SECTION 2: Nautical & Chart Overlays -->
+          <section class="layer-group">
+            <details open>
+              <summary class="group-title">
+                <span class="title-with-icon">⚓ Nautical Charts &amp; Depths</span>
+                <span class="source-tag">Traficom / WMS</span>
+              </summary>
+              <div class="group-body">
+                <div class="overlay-block">
+                  <label class="control-row master-row">
+                    <input type="checkbox" id="toggleTraficomChart" />
+                    <span class="swatch swatch-chart"></span>
+                    <span class="control-label font-medium">Traficom Nautical Charts</span>
+                  </label>
+                  <div class="sub-controls">
+                    <select id="traficomSeriesSelect" class="compact-select" aria-label="Traficom chart series">
+                      <option value="merikarttasarjat" selected>All Nautical Series (Merikarttasarjat)</option>
+                      <option value="veneilykartat">Boating Charts (Veneilykartat)</option>
+                      <option value="rannikkokartat">Coastal Charts (Rannikkokartat)</option>
+                      <option value="s57">S-57 ENC Vector Chart (WMS)</option>
+                    </select>
+                    <div class="opacity-row">
+                      <span>Opacity</span>
+                      <input type="range" id="traficomOpacity" min="15" max="100" value="85" />
+                      <span id="traficomOpacityVal" class="mono">85%</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="overlay-block">
+                  <label class="control-row master-row">
+                    <input type="checkbox" id="toggleTraficomDepth" />
+                    <span class="swatch swatch-depth"></span>
+                    <span class="control-label font-medium">Vector Depth Contours</span>
+                    <span id="countDepth" class="count-pill">...</span>
+                  </label>
+                  <div class="sub-controls">
+                    <div class="opacity-row">
+                      <span>Depth threshold</span>
+                      <input type="range" id="depthThreshold" min="0.5" max="20" step="0.1" value="3.0" />
+                      <span id="depthThresholdVal" class="mono threshold-badge">3.0 m</span>
+                    </div>
+                    <div class="depth-legend-row">
+                      <span class="legend-chip shallow">&le; Threshold (Shallow)</span>
+                      <span class="legend-chip safe">&gt; Threshold (Safe)</span>
+                    </div>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleDepthAreas" checked />
+                      <span class="control-label">Shade shallow depth areas</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleDepthSoundings" checked />
+                      <span class="control-label">Show spot soundings (m)</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="overlay-block">
+                  <label class="control-row master-row">
+                    <input type="checkbox" id="toggleVayla" />
+                    <span class="swatch swatch-vayla"></span>
+                    <span class="control-label font-medium">Väylävirasto Fairways &amp; Aids</span>
+                  </label>
+                  <div class="sub-controls" id="vaylaSubControls">
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaFairways" />
+                      <span class="control-label">Fairway channels (Väylät)</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaNavLines" />
+                      <span class="control-label">Navigation lines (Navigointilinjat)</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaFairwayAreas" />
+                      <span class="control-label">Fairway areas (Väyläalueet)</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaMarks" />
+                      <span class="control-label">Seamarks &amp; buoys (Turvalaitteet)</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaLights" />
+                      <span class="control-label">Lights &amp; sectors (Loistot)</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaSpeedLimits" />
+                      <span class="control-label">Speed limit areas</span>
+                    </label>
+                    <label class="control-row mini-row">
+                      <input type="checkbox" id="toggleVaylaRestrictions" />
+                      <span class="control-label">Restriction areas</span>
+                    </label>
+                  </div>
+                </div>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleOpenSeaMap" />
+                  <span class="swatch swatch-openseamap"></span>
+                  <span class="control-label">OpenSeaMap seamarks</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="togglePropertyLines" />
+                  <span class="swatch swatch-prop"></span>
+                  <span class="control-label">MML property lines (Kiinteistörajat)</span>
+                </label>
+              </div>
+            </details>
+          </section>
+
+          <!-- SECTION 3: Live Points & Traffic -->
+          <section class="layer-group">
+            <details>
+              <summary class="group-title">
+                <span class="title-with-icon">📡 Live AIS &amp; Weather</span>
+                <button id="refreshLiveBtn" class="text-btn" title="Refresh AIS &amp; FMI observations" onclick="event.stopPropagation()">Refresh</button>
+              </summary>
+              <div class="group-body">
+                <label class="control-row">
+                  <input type="checkbox" id="toggleAis" />
+                  <span class="badge-icon badge-ais">▲</span>
+                  <span class="control-label">Fintraffic AIS Vessel Traffic</span>
+                  <span id="countAis" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleWarnings" />
+                  <span class="badge-icon badge-warn">⚠</span>
+                  <span class="control-label">Digitraffic Nautical Warnings</span>
+                  <span id="countWarnings" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleMareograph" />
+                  <span class="badge-icon badge-mareo">↕</span>
+                  <span class="control-label">FMI Mareograph Sea Levels</span>
+                  <span id="countMareograph" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleFmi" />
+                  <span class="badge-icon badge-fmi">~</span>
+                  <span class="control-label">FMI Weather Stations</span>
+                  <span id="countFmi" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleSeptit" />
+                  <span class="badge-icon badge-septit">S</span>
+                  <span class="control-label">Septit.net Pump-Out Stations</span>
+                  <span id="countSeptit" class="count-pill">...</span>
+                </label>
+              </div>
+            </details>
+          </section>
+
+          <!-- SECTION 4: Harbours & Shore Services -->
+          <section class="layer-group">
+            <details>
+              <summary class="group-title">
+                <span class="title-with-icon">⛵ Harbours &amp; Shore POIs</span>
+                <span class="source-tag">Lipas / OSM</span>
+              </summary>
+              <div class="group-body">
+                <label class="control-row">
+                  <input type="checkbox" id="toggleLipasHarbour" />
+                  <span class="badge-icon badge-harbour">⚓</span>
+                  <span class="control-label">Guest Harbours &amp; Marinas</span>
+                  <span id="countHarbour" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleLipasShelter" />
+                  <span class="badge-icon badge-shelter">⌂</span>
+                  <span class="control-label">Shelters (Laavut &amp; kodat)</span>
+                  <span id="countShelter" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleLipasHut" />
+                  <span class="badge-icon badge-hut">🛖</span>
+                  <span class="control-label">Wilderness Huts (Tuvat)</span>
+                  <span id="countHut" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleLipasCampfire" />
+                  <span class="badge-icon badge-fire">🔥</span>
+                  <span class="control-label">Campfire Sites (Tulipaikat)</span>
+                  <span id="countCampfire" class="count-pill">...</span>
+                </label>
+
+                <label class="control-row">
+                  <input type="checkbox" id="toggleOsm" />
+                  <span class="badge-icon badge-osm">P</span>
+                  <span class="control-label">OSM Boat Ramps &amp; Marinas</span>
+                  <span id="countOsm" class="count-pill">...</span>
+                </label>
+                <p id="osmHint" class="helper-text">Zoom in (z &ge; 9) to fetch OSM boating POIs in view.</p>
+              </div>
+            </details>
+          </section>
+        </div>
+      </div>
+    </aside>
+
+    <button id="sidebarExpandBtn" class="sidebar-expand-btn hidden" title="Show layer controls">
+      Layers &rsaquo;
+    </button>
+
+    <div class="map-stage">
+      <div id="map"></div>
+
+      <!-- Open-Meteo 24h Forecast Drawer -->
+      <div id="forecastDrawer" class="forecast-drawer hidden" role="region" aria-label="Open-Meteo 24h marine forecast">
+        <div class="forecast-header">
+          <div>
+            <h3>Open-Meteo Marine Forecast</h3>
+            <div id="forecastCoords" class="mono muted-sm">--</div>
+          </div>
+          <button id="closeForecastBtn" class="icon-btn" aria-label="Close forecast">&times;</button>
+        </div>
+        <div id="forecastCurrent" class="forecast-current"></div>
+        <div id="forecastHourly" class="forecast-hourly"></div>
+      </div>
+
+      <!-- Bottom-left status & disclaimer -->
+      <div class="map-footer-bar">
+        <div id="coordReadout" class="coord-pill mono">60.1350° N, 24.9600° E · 60° 08.100' N, 24° 57.600' E</div>
+        <div class="disclaimer-pill">
+          Not for navigational purposes; does not meet the requirements for official nautical charts.
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- DATA & LICENSES Modal -->
+  <div id="licensesModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="licensesTitle">
+    <div class="licenses-shell">
+      <div class="licenses-top">
+        <span id="licensesTitle" class="licenses-kicker">DATA &amp; LICENSES</span>
+        <button id="closeLicensesBtn" class="icon-btn" aria-label="Close Data and Licenses">&times;</button>
+      </div>
+
+      <div class="licenses-card">
+        <div class="license-item">
+          <h4>Traficom raster charts</h4>
+          <p>Contains Traficom nautical chart raster data / &copy; Traficom</p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Traficom depth data</h4>
+          <p>
+            Depth areas, contours &amp; soundings. Source: Finnish Transport and Communications Agency (Traficom).
+            Not for navigational purposes; does not meet the requirements for official nautical charts.
+          </p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Maanmittauslaitos</h4>
+          <p>Background map, aerial photos &amp; property lines; rocks, shoals &amp; lake depths &mdash; &copy;
+            Maanmittauslaitos</p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Väylävirasto</h4>
+          <p>Vector marine data (fairways, marks, areas) &mdash; &copy; Väylävirasto</p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Open-Meteo</h4>
+          <p>Weather data by Open-Meteo.com</p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>OpenStreetMap</h4>
+          <p>Boat ramps, marina &amp; service locations &mdash; &copy; OpenStreetMap contributors (ODbL).</p>
+          <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener">ODbL</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Lipas (JYU)</h4>
+          <p>
+            Harbours, boating service places &amp; outdoor rest structures (shelters, huts, campfire sites) &mdash;
+            Lipas data, University of Jyväskylä; Turku city harbours &mdash; City of Turku. Data edited, translated
+            and supplemented by the Luotsi community.
+          </p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Septit.net</h4>
+          <p>Pump-out (septi) stations &mdash; data from septit.net.</p>
+          <a href="https://septit.net/log/open_data.html" target="_blank" rel="noopener" class="mono-link">Open data</a>
+        </div>
+
+        <div class="license-item">
+          <h4>OpenSeaMap</h4>
+          <p>Seamark vector tile overlay (lights, buoys, beacons &amp; harbours) &mdash; &copy; OpenSeaMap contributors.
+          </p>
+          <a href="https://creativecommons.org/licenses/by-sa/2.0/" target="_blank" rel="noopener">CC BY-SA 2.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Fintraffic</h4>
+          <p>AIS vessel traffic &amp; Aids-to-Navigation (ATON) faults / nautical warnings &mdash; Traffic data:
+            Fintraffic / digitraffic.fi.</p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+
+        <div class="license-item">
+          <h4>Ilmatieteen laitos (FMI)</h4>
+          <p>Coastal &amp; lake weather station observations &amp; mareograph sea level gauges &mdash; Finnish
+            Meteorological Institute.</p>
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="app.js"></script>
+</body>
+
+</html>
