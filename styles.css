@@ -1745,6 +1745,16 @@ details.collapsible-card:not([open]) .fold-icon {
   color: #065f46;
 }
 
+.alt-meta-tag.safety-med {
+  background: rgba(245, 158, 11, 0.14);
+  color: #92400e;
+}
+
+.alt-meta-tag.safety-low {
+  background: rgba(239, 68, 68, 0.12);
+  color: #991b1b;
+}
+
 .alt-meta-tag.active-badge {
   background: var(--sea-accent);
   color: #ffffff;
@@ -1752,6 +1762,102 @@ details.collapsible-card:not([open]) .fold-icon {
   font-size: 9px;
   padding: 1px 5px;
   border-radius: 4px;
+}
+
+/* Safety Breakdown Panel */
+.route-safety-breakdown {
+  background: var(--bg-alabaster);
+  border: 1px solid var(--border-sand);
+  border-radius: var(--radius-md);
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.safety-bd-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--navy-ink);
+}
+
+.safety-bd-overall {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
+.safety-bd-overall.high {
+  background: rgba(16, 185, 129, 0.14);
+  color: #065f46;
+}
+
+.safety-bd-overall.med {
+  background: rgba(245, 158, 11, 0.16);
+  color: #92400e;
+}
+
+.safety-bd-overall.low {
+  background: rgba(239, 68, 68, 0.14);
+  color: #991b1b;
+}
+
+.safety-bd-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.safety-bd-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.safety-bd-row-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+}
+
+.safety-bd-label {
+  font-weight: 600;
+  color: var(--navy-ink);
+}
+
+.safety-bd-metric {
+  color: var(--slate-muted);
+  font-size: 9.5px;
+}
+
+.safety-bd-bar-track {
+  height: 4px;
+  background: var(--bg-subtle);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.safety-bd-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.safety-bd-bar-fill.high {
+  background: #10b981;
+}
+
+.safety-bd-bar-fill.med {
+  background: #f59e0b;
+}
+
+.safety-bd-bar-fill.low {
+  background: #ef4444;
 }
 
 .route-stat-grid {

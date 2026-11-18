@@ -1328,6 +1328,11 @@ function clearRoute() {
     altsBar.classList.add('hidden');
     altsBar.innerHTML = '';
   }
+  const safetyBd = document.getElementById('routeSafetyBreakdown');
+  if (safetyBd) {
+    safetyBd.classList.add('hidden');
+    safetyBd.innerHTML = '';
+  }
   document.getElementById('routeStatGrid').innerHTML = '';
   document.getElementById('routeWarningsList').innerHTML = '';
   document.getElementById('routeLegsList').innerHTML = '';
@@ -2293,8 +2298,88 @@ function renderComputedRoute(data) {
   });
 
   renderRouteAlternatives(data);
+  renderRouteSafetyBreakdown(data);
   summaryBox.classList.remove('hidden');
   document.getElementById('routeActiveIndicator')?.classList.remove('hidden');
+}
+
+function safetyLevelClass(score) {
+  if (score >= 80) return 'high';
+  if (score >= 60) return 'med';
+  return 'low';
+}
+
+function formatSafetyBreakdownTooltip(bd) {
+  if (!bd) return '';
+  const m = bd.metrics || {};
+  const parts = [
+    `Depth/UKC: ${bd.depth}/100${m.cautionDistPct > 0 ? ` (${m.cautionDistPct}% caution)` : ''}`,
+    `Rocks: ${bd.rocks}/100${m.minRockDistM != null ? ` (min ${m.minRockDistM} m, ${m.closeRocksCount} close)` : ' (clear)'}`,
+    `Shore: ${bd.shore}/100${m.minShoreDistM != null ? ` (min ${m.minShoreDistM} m)` : ' (open)'}`,
+    `Fairway/ATON: ${bd.fairway}/100 (${m.verifiedFairwayPct ?? 0}% verified${m.faultyMarks > 0 ? `, ${m.faultyMarks} faulty` : ''})`,
+  ];
+  return parts.join(' | ');
+}
+
+function renderRouteSafetyBreakdown(data) {
+  const el = document.getElementById('routeSafetyBreakdown');
+  if (!el) return;
+  const sc = data?.scores;
+  const bd = sc?.safetyBreakdown;
+  if (!bd || data?.summary?.routeFailed) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+
+  const m = bd.metrics || {};
+  const overall = Math.round(sc.safetyScore ?? 0);
+  const overallCls = safetyLevelClass(overall);
+
+  const depthText = m.cautionDistPct > 0 ? `${m.cautionDistPct}% caution water` : 'Clear depth headroom';
+  const rockText =
+    m.minRockDistM != null
+      ? `Min ${m.minRockDistM} m${m.closeRocksCount > 0 ? ` · ${m.closeRocksCount} within 75 m` : ''}`
+      : 'No rocks within 120 m';
+  const shoreText =
+    m.minShoreDistM != null
+      ? `Min ${m.minShoreDistM} m${m.narrowDistPct > 0 ? ` · ${m.narrowDistPct}% narrow` : ''}`
+      : 'Open water (>120 m)';
+  const fwText =
+    `${m.verifiedFairwayPct ?? 0}% verified${m.faultyMarks > 0 ? ` · ${m.faultyMarks} faulty ATON` : ''}`;
+
+  const rows = [
+    { label: 'Depth & UKC', score: bd.depth, metric: depthText },
+    { label: 'Rocks & Hazards', score: bd.rocks, metric: rockText },
+    { label: 'Shore Clearance', score: bd.shore, metric: shoreText },
+    { label: 'Fairway & ATON', score: bd.fairway, metric: fwText },
+  ];
+
+  el.innerHTML = `
+    <div class="safety-bd-header">
+      <span>Maritime Safety Score</span>
+      <span class="safety-bd-overall mono ${overallCls}">${overall}/100</span>
+    </div>
+    <div class="safety-bd-rows">
+      ${rows
+        .map((r) => {
+          const cls = safetyLevelClass(r.score);
+          return `
+            <div class="safety-bd-row">
+              <div class="safety-bd-row-top">
+                <span class="safety-bd-label">${escapeHtml(r.label)}</span>
+                <span class="safety-bd-metric">${escapeHtml(r.metric)} · <strong class="mono">${r.score}</strong></span>
+              </div>
+              <div class="safety-bd-bar-track">
+                <div class="safety-bd-bar-fill ${cls}" style="width:${Math.max(4, Math.min(100, r.score))}%"></div>
+              </div>
+            </div>
+          `;
+        })
+        .join('')}
+    </div>
+  `;
+  el.classList.remove('hidden');
 }
 
 function selectRouteAlternative(targetObjective) {
@@ -2352,6 +2437,7 @@ function renderRouteAlternatives(data) {
     distanceNm: data.summary?.totalDistNm ?? 0,
     fairwayPct: data.summary?.fairwayPct ?? 0,
     safetyScore: data.scores?.safetyScore ?? null,
+    safetyBreakdown: data.scores?.safetyBreakdown ?? null,
     riskScore: data.scores?.riskScore ?? null,
     isActive: true,
   });
@@ -2366,6 +2452,7 @@ function renderRouteAlternatives(data) {
 
     const altDistNm = alt.scores?.distanceNm ?? alt.summary?.totalDistNm ?? 0;
     const altFairwayPct = alt.scores?.fairwayPct ?? alt.summary?.fairwayPct ?? 0;
+    const altSafety = alt.scores?.safetyScore ?? null;
 
     allCards.push({
       objective: alt.objective,
@@ -2374,7 +2461,8 @@ function renderRouteAlternatives(data) {
       color: meta.color,
       distanceNm: altDistNm,
       fairwayPct: altFairwayPct,
-      safetyScore: alt.scores?.safetyScore ?? null,
+      safetyScore: altSafety,
+      safetyBreakdown: alt.scores?.safetyBreakdown ?? null,
       riskScore: alt.scores?.riskScore ?? null,
       isActive: false,
     });
@@ -2397,8 +2485,9 @@ function renderRouteAlternatives(data) {
         lineCap: 'round',
       });
 
+      const safetyLine = altSafety != null ? ` · Safety ${Math.round(altSafety)}/100` : '';
       altPoly.bindTooltip(
-        `<div style="font-size:11px;"><strong>${meta.icon} ${escapeHtml(meta.label)}</strong><br/>${altDistNm.toFixed(2)} NM · ${altFairwayPct}% fairway<br/><span style="color:#0d9488;font-weight:600;">Click to select this route</span></div>`,
+        `<div style="font-size:11px;"><strong>${meta.icon} ${escapeHtml(meta.label)}</strong><br/>${altDistNm.toFixed(2)} NM · ${altFairwayPct}% fairway${safetyLine}<br/><span style="color:#0d9488;font-weight:600;">Click to select this route</span></div>`,
         { sticky: true }
       );
 
@@ -2423,9 +2512,11 @@ function renderRouteAlternatives(data) {
     </div>
     <div class="alternatives-list">
       ${allCards
-        .map(
-          (c) => `
-        <button type="button" class="alt-chip ${c.isActive ? 'active' : ''}" data-obj="${escapeHtml(c.objective)}">
+        .map((c) => {
+          const sCls = c.safetyScore != null ? `safety-${safetyLevelClass(c.safetyScore)}` : '';
+          const tip = formatSafetyBreakdownTooltip(c.safetyBreakdown);
+          return `
+        <button type="button" class="alt-chip ${c.isActive ? 'active' : ''}" data-obj="${escapeHtml(c.objective)}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>
           <div class="alt-chip-top">
             <div class="alt-chip-label-wrap">
               <span class="alt-icon">${c.icon}</span>
@@ -2436,11 +2527,11 @@ function renderRouteAlternatives(data) {
           </div>
           <div class="alt-chip-meta">
             <span class="alt-meta-tag">${c.fairwayPct}% fairway</span>
-            ${c.safetyScore != null ? `<span class="alt-meta-tag ${c.safetyScore >= 80 ? 'safety-high' : ''}">Safety ${Math.round(c.safetyScore)}/100</span>` : ''}
+            ${c.safetyScore != null ? `<span class="alt-meta-tag ${sCls}">Safety ${Math.round(c.safetyScore)}/100</span>` : ''}
           </div>
         </button>
-      `
-        )
+      `;
+        })
         .join('')}
     </div>
   `;

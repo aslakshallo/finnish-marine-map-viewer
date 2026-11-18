@@ -1875,13 +1875,304 @@ const OBJECTIVE_PROFILES = {
 };
 
 /**
- * Compute simple scalar scores for multi-objective comparison / Pareto ranking.
+ * Physically evaluate maritime safety along a route polyline using the already-indexed
+ * Traficom hydrographic data (depths, contours, soundings, shorelines, fairways, seamarks)
+ * and S-57 rock database. Returns 0–100 sub-scores across 4 pillars:
+ *   1. Depth & UKC (35%)
+ *   2. Charted Rocks & Underwater Hazards (30%)
+ *   3. Shoreline & Narrow Passage Clearance (20%)
+ *   4. Fairway Quality & Navigational Aids (15%)
+ * Note: Sharp turns / course changes are intentionally NOT penalized.
+ */
+function evaluateRouteSafety(waypointsXY, index, opts = {}) {
+  const effectiveSafeDepth = Number(opts.effectiveSafeDepth) || 2.0;
+  const signedOffsetM = Number(opts.signedOffsetM) || 0;
+  const usedFallback = Boolean(opts.usedFallback);
+  const usedShallowWaterFallback = Boolean(opts.usedShallowWaterFallback);
+
+  if (!Array.isArray(waypointsXY) || waypointsXY.length < 2 || !index) {
+    return null;
+  }
+
+  let totalDistM = 0;
+  for (let i = 0; i < waypointsXY.length - 1; i++) {
+    totalDistM += Math.hypot(waypointsXY[i + 1].x - waypointsXY[i].x, waypointsXY[i + 1].y - waypointsXY[i].y);
+  }
+  if (totalDistM < 1) return null;
+
+  const totalDistNm = totalDistM / 1852;
+  const approachZoneM = Math.min(120, totalDistM * 0.12);
+  const fwTol = 28 + Math.abs(signedOffsetM);
+
+  let cumDist = 0;
+  let enRouteDistM = 0;
+  let verifiedFairwayDistM = 0;
+  let shallowFairwayDistM = 0;
+  let cautionDistM = 0;
+  let depthPenaltySum = 0;
+  let shallowSoundingDistM = 0;
+  let nearShallowContourDistM = 0;
+  let narrowExposureSum = 0;
+  let narrowDistM = 0;
+  let minShoreDistM = Infinity;
+  let minShoreOnVerifiedFw = false;
+
+  const rockMinDistMap = new Map(); // id -> { dist, sev, isHidden, onVerifiedFw }
+  let rawMinRockDistM = Infinity;
+  const faultyMarkIds = new Set();
+
+  for (let i = 0; i < waypointsXY.length - 1; i++) {
+    const ax = waypointsXY[i].x;
+    const ay = waypointsXY[i].y;
+    const bx = waypointsXY[i + 1].x;
+    const by = waypointsXY[i + 1].y;
+    const legDistM = Math.hypot(bx - ax, by - ay);
+    if (legDistM < 0.5) continue;
+
+    const nSteps = Math.max(1, Math.ceil(legDistM / 30));
+    const ds = legDistM / nSteps;
+
+    for (let s = 0; s < nSteps; s++) {
+      const t = (s + 0.5) / nSteps;
+      const mx = ax + (bx - ax) * t;
+      const my = ay + (by - ay) * t;
+      const midDist = cumDist + (s + 0.5) * ds;
+      const isDockZone = midDist < approachZoneM || totalDistM - midDist < approachZoneM;
+
+      // 1. Fairway status
+      const fwHit = pointOnSafeFairway(mx, my, index, fwTol, true);
+      const fw = fwHit ? fwHit.seg : null;
+      const onVerifiedFw = Boolean(fw && fw.verifiedDepth);
+      if (onVerifiedFw) {
+        verifiedFairwayDistM += ds;
+      } else if (fw) {
+        shallowFairwayDistM += ds;
+      }
+
+      // 2. Depth & UKC status
+      const waterCand = index.waterAreaIndex.query(mx - 5, my - 5, mx + 5, my + 5);
+      const waterStatus = checkWaterAtPoint(mx, my, waterCand);
+
+      if (onVerifiedFw) {
+        // Surveyed official fairway swept deeper than effectiveSafeDepth
+      } else if (waterStatus === 'land') {
+        cautionDistM += ds;
+        depthPenaltySum += ds * 1.0;
+      } else if (waterStatus === 'shallow-area' || (fw && fw.fairwayDepth != null && fw.fairwayDepth < effectiveSafeDepth)) {
+        cautionDistM += ds;
+        depthPenaltySum += ds * (fw ? 0.45 : 0.85);
+      } else {
+        // Open deep water: evaluate depth headroom from enclosing polygons
+        let bestDrval1 = -1;
+        for (let wi = 0; wi < waterCand.length; wi++) {
+          const a = waterCand[wi];
+          const ob = a.ringBoxes[0];
+          if (mx < ob[0] || mx > ob[2] || my < ob[1] || my > ob[3]) continue;
+          if (!pointInRing(mx, my, a.ringsXY[0])) continue;
+          if (a.drval1 > bestDrval1) bestDrval1 = a.drval1;
+        }
+        if (bestDrval1 >= 0 && bestDrval1 < effectiveSafeDepth) {
+          // Broad coastal band (e.g. 0–10 m) where local shoals can exist
+          depthPenaltySum += ds * 0.14;
+        } else if (bestDrval1 >= effectiveSafeDepth && bestDrval1 < effectiveSafeDepth + 2.5) {
+          depthPenaltySum += ds * 0.04;
+        }
+      }
+
+      // Shallow soundings & shallow contours outside verified swept fairways
+      if (!onVerifiedFw) {
+        if (index.shallowSoundings.length > 0) {
+          const sCand = index.soundingIndex.query(mx - 40, my - 40, mx + 40, my + 40);
+          let hitSounding = false;
+          for (let si = 0; si < sCand.length; si++) {
+            const sd = Math.hypot(mx - sCand[si].x, my - sCand[si].y);
+            if (sd <= 35) {
+              hitSounding = true;
+              break;
+            }
+          }
+          if (hitSounding) shallowSoundingDistM += ds;
+        }
+        if (index.shallowContours.length > 0) {
+          const cCand = index.contourIndex.query(mx - 25, my - 25, mx + 25, my + 25);
+          let hitContour = false;
+          for (let ci = 0; ci < cCand.length; ci++) {
+            const c = cCand[ci];
+            if (pointToSegmentDist(mx, my, c.ax, c.ay, c.bx, c.by) <= 20) {
+              hitContour = true;
+              break;
+            }
+          }
+          if (hitContour) nearShallowContourDistM += ds;
+        }
+      }
+
+      // 3. Charted rocks & underwater hazards (within 120 m)
+      if (index.allRocks && index.allRocks.length > 0) {
+        const rCand = index.rockIndex.query(mx - 120, my - 120, mx + 120, my + 120);
+        for (let ri = 0; ri < rCand.length; ri++) {
+          const r = rCand[ri];
+          const d = Math.hypot(mx - r.x, my - r.y);
+          if (d > 120) continue;
+          const isHidden = r.waterLevel === 'submerged' || r.waterLevel === 'awash' || r.type === 'wreck';
+          const sev = isHidden ? 1.0 : 0.65;
+          if (!onVerifiedFw && d < rawMinRockDistM) {
+            rawMinRockDistM = d;
+          } else if (rawMinRockDistM === Infinity && d < rawMinRockDistM) {
+            rawMinRockDistM = d;
+          }
+          const prev = rockMinDistMap.get(r.id);
+          if (!prev || d < prev.dist) {
+            rockMinDistMap.set(r.id, { dist: d, sev, isHidden, onVerifiedFw });
+          }
+        }
+      }
+
+      // 4. Shoreline & narrow passage clearance (en-route, outside shared dock zones)
+      if (!isDockZone) {
+        enRouteDistM += ds;
+        if (index.shorelineSegments.length > 0) {
+          const shCand = index.shorelineIndex.query(mx - 120, my - 120, mx + 120, my + 120);
+          let dShore = 120;
+          for (let shi = 0; shi < shCand.length; shi++) {
+            const seg = shCand[shi];
+            if (mx < seg.minX - dShore || mx > seg.maxX + dShore || my < seg.minY - dShore || my > seg.maxY + dShore) {
+              continue;
+            }
+            const d = pointToSegmentDist(mx, my, seg.ax, seg.ay, seg.bx, seg.by);
+            if (d < dShore) dShore = d;
+          }
+          if (dShore < minShoreDistM) {
+            minShoreDistM = dShore;
+            minShoreOnVerifiedFw = onVerifiedFw;
+          }
+          if (dShore < 60) {
+            const tightness = (60 - dShore) / 60;
+            const fwDiscount = onVerifiedFw ? 0.35 : 1.0;
+            narrowExposureSum += ds * tightness * fwDiscount;
+            if (dShore < 50 && !onVerifiedFw) {
+              narrowDistM += ds;
+            }
+          }
+        }
+      }
+
+      // 5. Nearby faulty ATON seamarks (within 220 m)
+      if (index.allSeamarks.length > 0) {
+        const mCand = index.seamarkIndex.query(mx - 220, my - 220, mx + 220, my + 220);
+        for (let mi = 0; mi < mCand.length; mi++) {
+          const m = mCand[mi];
+          if (!m.isFaulty) continue;
+          if (Math.hypot(mx - m.x, my - m.y) <= 220) {
+            faultyMarkIds.add(m.id);
+          }
+        }
+      }
+    }
+
+    cumDist += legDistM;
+  }
+
+  // --- Sub-score 1: Depth & UKC (35%) ---
+  const depthExposureFrac = Math.min(1, depthPenaltySum / totalDistM);
+  const soundingFrac = Math.min(1, shallowSoundingDistM / totalDistM);
+  const contourFrac = Math.min(1, nearShallowContourDistM / totalDistM);
+  const fallbackPenalty = usedShallowWaterFallback ? 16 : usedFallback ? 6 : 0;
+  const depthPenalty =
+    55 * Math.pow(depthExposureFrac, 0.75) +
+    25 * Math.pow(soundingFrac, 0.7) +
+    15 * Math.pow(contourFrac, 0.8) +
+    fallbackPenalty;
+  const depthScore = Math.max(0, Math.min(100, 100 - depthPenalty));
+
+  // --- Sub-score 2: Charted Rocks & Underwater Hazards (30%) ---
+  let worstRockRisk = 0;
+  let rockExposure = 0;
+  let closeRocksCount = 0;
+  let hiddenRocksCloseCount = 0;
+
+  for (const info of rockMinDistMap.values()) {
+    const fwDiscount = info.onVerifiedFw ? 0.45 : 1.0;
+    const d = info.dist;
+    let curve = 0;
+    if (d <= 10) curve = 1.0;
+    else if (d <= 30) curve = 1.0 - ((d - 10) / 20) * 0.45; // 1.0 -> 0.55
+    else if (d <= 60) curve = 0.55 - ((d - 30) / 30) * 0.35; // 0.55 -> 0.20
+    else if (d <= 100) curve = 0.20 - ((d - 60) / 40) * 0.20; // 0.20 -> 0.0
+
+    const risk = info.sev * fwDiscount * curve;
+    if (risk > worstRockRisk) worstRockRisk = risk;
+
+    if (d < 90) {
+      rockExposure += info.sev * fwDiscount * ((90 - d) / 90);
+    }
+    if (d <= 75 && !info.onVerifiedFw) {
+      closeRocksCount++;
+      if (info.isHidden) hiddenRocksCloseCount++;
+    }
+  }
+
+  const rockBottleneckPenalty = 42 * worstRockRisk;
+  const rockDensity = rockExposure / Math.max(0.8, totalDistNm);
+  const rockDensityPenalty = 45 * (1 - Math.exp(-rockDensity / 2.5));
+  const rockScore = Math.max(0, Math.min(100, 100 - rockBottleneckPenalty - rockDensityPenalty));
+
+  // --- Sub-score 3: Shoreline & Narrow Passages (20%) ---
+  let shoreBottleneck = 0;
+  if (minShoreDistM < 15) shoreBottleneck = 30;
+  else if (minShoreDistM < 35) shoreBottleneck = 30 - (minShoreDistM - 15) * 0.9;
+  else if (minShoreDistM < 70) shoreBottleneck = 12 - (minShoreDistM - 35) * (12 / 35);
+  if (minShoreOnVerifiedFw) shoreBottleneck *= 0.4;
+
+  const narrowExposureFrac = enRouteDistM > 0 ? Math.min(1, narrowExposureSum / enRouteDistM) : 0;
+  const shoreExposurePenalty = 55 * Math.pow(narrowExposureFrac, 0.75);
+  const shoreScore = Math.max(0, Math.min(100, 100 - shoreBottleneck - shoreExposurePenalty));
+
+  // --- Sub-score 4: Fairway Quality & Navigational Aids (15%) ---
+  const verifiedFrac = Math.min(1, verifiedFairwayDistM / totalDistM);
+  const shallowFwFrac = Math.min(1, shallowFairwayDistM / totalDistM);
+  const fairwayBase = Math.min(100, 68 + verifiedFrac * 32 + shallowFwFrac * 14);
+  const faultyMarksCount = faultyMarkIds.size;
+  const faultyPenalty = Math.min(35, faultyMarksCount * 9);
+  const fairwayScore = Math.max(0, Math.min(100, fairwayBase - faultyPenalty));
+
+  // --- Combined Weighted Maritime Safety Score ---
+  const safetyScore = Math.max(
+    0,
+    Math.min(100, depthScore * 0.35 + rockScore * 0.30 + shoreScore * 0.20 + fairwayScore * 0.15)
+  );
+  const riskScore = Math.max(0, Math.min(100, 100 - safetyScore));
+
+  return {
+    safetyScore: Number(safetyScore.toFixed(1)),
+    riskScore: Number(riskScore.toFixed(1)),
+    breakdown: {
+      depth: Math.round(depthScore),
+      rocks: Math.round(rockScore),
+      shore: Math.round(shoreScore),
+      fairway: Math.round(fairwayScore),
+      metrics: {
+        minRockDistM: rawMinRockDistM < 120 ? Math.round(rawMinRockDistM) : null,
+        closeRocksCount,
+        hiddenRocksCloseCount,
+        minShoreDistM: minShoreDistM < 120 ? Math.round(minShoreDistM) : null,
+        cautionDistPct: Number(((cautionDistM / totalDistM) * 100).toFixed(1)),
+        verifiedFairwayPct: Math.round(verifiedFrac * 100),
+        narrowDistPct: enRouteDistM > 0 ? Number(((narrowDistM / enRouteDistM) * 100).toFixed(1)) : 0,
+        faultyMarks: faultyMarksCount,
+      },
+    },
+  };
+}
+
+/**
+ * Compute multi-objective comparison scores / Pareto ranking using physical hydrographic safety.
  * Higher safetyScore and efficiencyScore are better; lower riskScore is better.
  */
-function scoreRouteResult(summary, totalDistNm, fairwayPct, cautionLegs, faultyMarksNearby, routeFailed) {
+function scoreRouteResult(summary, totalDistNm, fairwayPct, cautionLegs, faultyMarksNearby, routeFailed, safetyEval = null) {
   if (routeFailed) {
     return {
-      distanceNm: totalDistNm,
+      distanceNm: Number((totalDistNm || 0).toFixed(2)),
       etaMinutes: summary?.etaMinutes ?? null,
       fairwayPct: 0,
       cautionLegs: 99,
@@ -1889,27 +2180,37 @@ function scoreRouteResult(summary, totalDistNm, fairwayPct, cautionLegs, faultyM
       safetyScore: 0,
       efficiencyScore: 0,
       composite: 0,
+      safetyBreakdown: null,
     };
   }
 
-  // Risk: caution legs dominate, then low fairway use and faulty marks
-  const riskScore = Math.min(
-    100,
-    cautionLegs * 12 +
-    Math.max(0, 55 - fairwayPct) * 0.55 +
-    (faultyMarksNearby || 0) * 6 +
-    (summary?.usedFallback ? 8 : 0) +
-    (summary?.usedShallowWaterFallback ? 15 : 0)
-  );
+  let riskScore;
+  let safetyScore;
+  let safetyBreakdown = null;
 
-  // Safety: inverse of risk, boosted by high fairway adherence
-  const safetyScore = Math.max(0, Math.min(100, 100 - riskScore + fairwayPct * 0.15));
+  if (safetyEval) {
+    safetyScore = safetyEval.safetyScore;
+    riskScore = safetyEval.riskScore;
+    safetyBreakdown = safetyEval.breakdown;
+  } else {
+    // Fallback heuristic if spatial index evaluation was unavailable
+    const legRatio = Math.min(1, cautionLegs / Math.max(4, totalDistNm * 6));
+    riskScore = Math.min(
+      100,
+      legRatio * 45 +
+      Math.max(0, 55 - fairwayPct) * 0.4 +
+      (faultyMarksNearby || 0) * 6 +
+      (summary?.usedFallback ? 6 : 0) +
+      (summary?.usedShallowWaterFallback ? 16 : 0)
+    );
+    safetyScore = Math.max(0, Math.min(100, 100 - riskScore));
+  }
 
-  // Efficiency: shorter is better (normalised later against alternatives)
-  const efficiencyScore = Math.max(0, 100 - totalDistNm * 1.8); // rough for coastal NM scales
+  // Efficiency: shorter is better
+  const efficiencyScore = Math.max(0, 100 - totalDistNm * 1.8);
 
   // Composite used only for default ranking when client does not specify preference
-  const composite = safetyScore * 0.45 + efficiencyScore * 0.35 + fairwayPct * 0.2;
+  const composite = safetyScore * 0.50 + efficiencyScore * 0.30 + fairwayPct * 0.20;
 
   return {
     distanceNm: Number(totalDistNm.toFixed(2)),
@@ -1920,24 +2221,35 @@ function scoreRouteResult(summary, totalDistNm, fairwayPct, cautionLegs, faultyM
     safetyScore: Number(safetyScore.toFixed(1)),
     efficiencyScore: Number(efficiencyScore.toFixed(1)),
     composite: Number(composite.toFixed(1)),
+    safetyBreakdown,
   };
 }
 
 /**
- * Simple Pareto filter: keep routes that are not dominated on (distance, risk).
- * A route A dominates B if A is no worse on both axes and strictly better on at least one.
+ * Pareto filter: keep routes that are not dominated on (distance, risk),
+ * and deduplicate virtually identical paths (within 0.01 NM and 0.3 risk pts).
  */
 function filterParetoAlternatives(alts) {
   if (alts.length <= 1) return alts;
+  const deduped = [];
+  for (const alt of alts) {
+    if (alt.summary?.routeFailed) continue;
+    const duplicate = deduped.some(
+      (k) =>
+        Math.abs(k.scores.distanceNm - alt.scores.distanceNm) <= 0.01 &&
+        Math.abs(k.scores.riskScore - alt.scores.riskScore) <= 0.3
+    );
+    if (!duplicate) deduped.push(alt);
+  }
+  if (deduped.length <= 1) return deduped.length > 0 ? deduped : alts.slice(0, 1);
+
   const kept = [];
-  for (let i = 0; i < alts.length; i++) {
-    const a = alts[i];
-    if (a.summary?.routeFailed) continue;
+  for (let i = 0; i < deduped.length; i++) {
+    const a = deduped[i];
     let dominated = false;
-    for (let j = 0; j < alts.length; j++) {
+    for (let j = 0; j < deduped.length; j++) {
       if (i === j) continue;
-      const b = alts[j];
-      if (b.summary?.routeFailed) continue;
+      const b = deduped[j];
       const aDist = a.scores.distanceNm;
       const bDist = b.scores.distanceNm;
       const aRisk = a.scores.riskScore;
@@ -1949,8 +2261,7 @@ function filterParetoAlternatives(alts) {
     }
     if (!dominated) kept.push(a);
   }
-  // Always keep at least the primary if everything was filtered
-  return kept.length > 0 ? kept : alts.slice(0, 1);
+  return kept.length > 0 ? kept : deduped.slice(0, 1);
 }
 
 function parseLatLonList(raw, maxItems = 15) {
@@ -4678,14 +4989,23 @@ async function computeMarineRoute(params) {
     mapMarkers: debugMapMarkers,
   };
 
-  // Primary scores for multi-objective comparison
+  // Primary physical hydrographic safety evaluation & scores
+  const primarySafetyEval = !routeFailed
+    ? evaluateRouteSafety(waypointsXY, index, {
+      effectiveSafeDepth,
+      signedOffsetM,
+      usedFallback,
+      usedShallowWaterFallback,
+    })
+    : null;
   const primaryScores = scoreRouteResult(
     { etaMinutes, usedFallback, usedShallowWaterFallback },
     totalDistNm,
     fairwayPct,
     cautionLegs,
     faultyMarksNearby,
-    routeFailed
+    routeFailed,
+    primarySafetyEval
   );
 
   // Build alternative route summaries (geometry + scores) when multi-objective was requested
@@ -4729,6 +5049,16 @@ async function computeMarineRoute(params) {
       const altDistNm = altDistM / 1852;
       const altFairwayPct = altDistM > 0 ? Math.round((altFairwayDistM / altDistM) * 100) : 0;
       const altEta = Math.round((altDistNm / speedKn) * 60);
+      const altSafetyEval = osr.routeFailed
+        ? null
+        : ai === 0 && primarySafetyEval
+          ? primarySafetyEval
+          : evaluateRouteSafety(osr.waypointsXY, index, {
+            effectiveSafeDepth,
+            signedOffsetM,
+            usedFallback: osr.usedFallback,
+            usedShallowWaterFallback: osr.usedShallowWaterFallback,
+          });
       const altScores = scoreRouteResult(
         {
           etaMinutes: altEta,
@@ -4738,8 +5068,9 @@ async function computeMarineRoute(params) {
         altDistNm,
         altFairwayPct,
         altCautionLegs,
-        0,
-        osr.routeFailed
+        altSafetyEval?.breakdown?.metrics?.faultyMarks || 0,
+        osr.routeFailed,
+        altSafetyEval
       );
 
       alternatives.push({
